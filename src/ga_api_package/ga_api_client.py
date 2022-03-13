@@ -1,3 +1,9 @@
+# Some Dataset/Pipeline API is required
+# - Append: open if exist, create if not exist
+#   - The problem is create throws error if exist
+# - Overwrite: delete if exist, then create
+#   - The problem is delete throws error if not exist
+
 import asyncio
 import aiohttp
 import os
@@ -337,7 +343,7 @@ class Adhoc:
         for ts, rlt in zip(dr, rlts):
             tls = _translate_table(rlt, ts)
             data.extend(tls)
-        return _set_index(pd.DataFrame(data), self.pipeline)
+        return pd.DataFrame(data)
 
 class Pipeline:
     def __init__(self, tenant, dset, plid, conf):
@@ -356,7 +362,7 @@ class Pipeline:
         data = []
         for ts, rlt in zip(dr, rlts):
             data += _translate_table(rlt, ts)
-        return _set_index(pd.DataFrame(data), self.conf['pipeline'])
+        return pd.DataFrame(data)
 
 class Dataset:
     def __init__(self, tenant, dsid, conf):
@@ -388,7 +394,7 @@ class Dataset:
     async def del_pipeline(self, plid):
         await self.tenant.delete_pipeline(self.dsid, plid)
 
-    async def del_all_pipelines(self, plid):
+    async def del_all_pipelines(self):
         await self.tenant.delete_all_pipelines(self.dsid)
 
     async def patch_data(self, ts, td, overwrite=False):
@@ -429,7 +435,7 @@ class Dataset:
         dfd = {}
         for pkey, pdat in data.items():
             # the strange type casting is caused by using pid as object key
-            df = _set_index(pd.DataFrame(pdat), pipe_dict[int(pkey)])
+            df = pd.DataFrame(pdat), pipe_dict[int(pkey)]
             dfd[pkey] = df
         return dfd
 
@@ -450,6 +456,9 @@ class Repository:
             item.update(dset['status'])
             dset_dict[dset['_id']] = item
         return pd.DataFrame.from_dict(dset_dict, orient='index')
+
+    async def del_all_datasets(self):
+        await self.tenant.delete_all_datasets()
 
     async def get_dataset(self, dsid):
         desc = await self.tenant.get_dataset(dsid)

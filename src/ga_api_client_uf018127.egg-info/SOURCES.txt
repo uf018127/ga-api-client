@@ -1,0 +1,10 @@
+LICENSE
+README.md
+pyproject.toml
+setup.cfg
+src/ga_api_client_uf018127.egg-info/PKG-INFO
+src/ga_api_client_uf018127.egg-info/SOURCES.txt
+src/ga_api_client_uf018127.egg-info/dependency_links.txt
+src/ga_api_client_uf018127.egg-info/top_level.txt
+src/ga_api_package/__init__.py
+src/ga_api_package/ga_api_client.py
