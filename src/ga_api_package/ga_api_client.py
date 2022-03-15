@@ -5,18 +5,16 @@
 #   - The problem is delete throws error if not exist
 
 import asyncio
-import aiohttp
 import os
 import time
 import base64
 import getpass
 import json
 import math
-from functools import reduce
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-import pandas as pd
-from collections import OrderedDict
+import logging
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes # 36.0.0
+import aiohttp # 3.8.1
+import pandas as pd # 1.4.2
 
 def pprint(value, indent=4, depth=0):
     if isinstance(value, dict):
@@ -70,20 +68,26 @@ def pprint(value, indent=4, depth=0):
     else: # simple
         print(json.dumps(value), end='')
 
+class UnexpectedStatus(Exception):
+    def __init__(self, status, message):
+        self.status = status
+        self.message = message
+        super().__init__(self.message)
+
 class HyperLogLog:
     def __init__(self, arg=None):
         if arg is None: # zero
-            self.rmem = bytes(2048)
+            self._rmem = bytes(2048)
         elif isinstance(arg, str): # HyperLogLog Literal
-            self.rmem = bytes.fromhex(arg[2:])
-        elif type(arg) == bytes: # rmem
-            self.rmem = arg
+            self._rmem = bytes.fromhex(arg[2:])
+        elif type(arg) == bytes: # register mem
+            self._rmem = arg
         else:
             raise Exception('HyperLogLog construct error')
         pass
 
     def __add__(self, other):
-        return HyperLogLog(bytes(max(a,b) for a, b in zip(self.rmem, other.rmem)))
+        return HyperLogLog(bytes(max(a,b) for a, b in zip(self._rmem, other._rmem)))
 
     def __str__(self):
         return '<HyperLogLog>'
@@ -92,7 +96,7 @@ class HyperLogLog:
         N = 1 << 11
         V = 0
         S = 0
-        for r in self.rmem:
+        for r in self._rmem:
             if r == 0:
                 V += 1
             S += 2**(0-r)
@@ -111,19 +115,18 @@ class ResponseError(Exception):
         super().__init__(text)
 
 class Client:
-    def __init__(self, url, user, tenant, password, ssl=True, burst=1, verbose=False):
+    def __init__(self, url, user, tenant, password, ssl=True, burst=1):
         self.url = url # base url
         self.user = user # user name
         self.tenant = tenant # tenant name
         self.password = base64.b64encode(password.encode('utf-8')).decode() # base64 encoded password
         self.ssl = ssl
         self.sem = asyncio.Semaphore(burst)
-        self.verbose = verbose
-        self.session = aiohttp.ClientSession()
         self.headers = {
             'Content-Type': 'application/json'
         }
         self.last_auth = 0
+        self.session = aiohttp.ClientSession()
 
     async def authenticate(self):
         if time.time() - self.last_auth < ACCESS_TOKEN_TIMEOUT:
@@ -134,18 +137,16 @@ class Client:
             'password': self.password # user password
         }
         # bringup
-        if self.verbose:
-            print(f'authenticate(): bringup')
+        logging.debug(f'authenticate(): bringup')
         url = self.url+f'/bringup?name={self.tenant}'
         async with self.session.get(url, timeout=AIO_TIMEOUT, headers=self.headers, ssl=self.ssl) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                raise Exception(f'status={resp.status}, text={text}')
+                raise UnexpectedStatus(resp.status, text)
             bringup = await resp.json()
         # do captcha when enabled
         if bringup['captchaEnabled']:
-            if self.verbose:
-                print(f'authenticate(): captcha')
+            logging.debug(f'authenticate(): captcha')
             key = os.urandom(24)
             iv = os.urandom(16)
             data = {
@@ -155,7 +156,7 @@ class Client:
             async with self.session.post(self.url+'/captcha', json=data, timeout=AIO_TIMEOUT, headers=self.headers, ssl=self.ssl) as resp:
                 if resp.status != 201:
                     text = await resp.text()
-                    raise Exception(f'status={resp.status}, text={text}')
+                    raise UnexpectedStatus(resp.status, text)
                 # decrypt answer
                 captcha = await resp.json()
                 ct = base64.b64decode(captcha['answer'])
@@ -167,12 +168,12 @@ class Client:
                     'answer': answer_s
                 }
         # do authenticate
-        if self.verbose:
-            print(f'authenticate(): authenticate')
+        logging.debug(f'authenticate(): authenticate')
         url = self.url+'/authentication'
         async with self.session.post(url, json=authData, timeout=AIO_TIMEOUT, headers=self.headers, ssl=self.ssl) as resp:
             if resp.status != 201:
-                raise Exception(f'status={resp.status}, text={resp.text}')
+                text = await resp.text()
+                raise UnexpectedStatus(resp.status, text)
             body = await resp.json()
             self.headers = {
                 'Content-Type': 'application/json',
@@ -182,10 +183,9 @@ class Client:
 
     async def request(self, method, path, code, data=None):
         await self.authenticate()
-        while True:
-            async with self.sem:
-                if self.verbose:
-                    print(f'request(): {method} {path}')
+        async with self.sem:
+            while True:
+                logging.debug(f'request(): {method} {path}')
                 async with self.session.request(method, self.url+path, json=data, timeout=AIO_TIMEOUT, headers=self.headers, ssl=self.ssl) as resp:
                     if resp.status == code:
                         if method != 'DELETE':
@@ -196,11 +196,15 @@ class Client:
                         continue
                     else:
                         text = await resp.text()
-                        raise Exception(f'status={resp.status}, text={text}')
+                        raise UnexpectedStatus(resp.status, text)
 
 class System(Client):
-    def __init__(self, url, user, password, ssl=True, verbose=False):
-        super().__init__(url, user, 'system', password, ssl=ssl, verbose=verbose)
+    def __init__(self, url, user=None, password=None, ssl=True):
+        if user is None:
+            user = input('User:')
+        if password is None:
+            password = getpass.getpass('Password:')
+        super().__init__(url, user, 'system', password, ssl=ssl)
 
     async def get_system(self):
         return await self.request('GET', '/cq/config', 200)
@@ -224,14 +228,20 @@ class System(Client):
         return await self.request('DELETE', f'/cq/config/tenant/{tid}', 204)
 
 class Tenant(Client):
-    def __init__(self, url, user, tenant, password, ssl=True, burst=1, verbose=False):
-        super().__init__(url, user, tenant, password, ssl=ssl, burst=burst, verbose=verbose)
-
-    async def close(self):
-        await self.session.close()
+    def __init__(self, url, user, tenant, password, ssl=True, burst=1):
+        super().__init__(url, user, tenant, password, ssl=ssl, burst=burst)
 
     async def create_adhoc(self, pipeline):
-        return await self.request('POST', '/pipeline', 201, pipeline)
+        while True:
+            try:
+                pid = await self.request('POST', '/pipeline', 201, pipeline)
+                break
+            except UnexpectedStatus as e:
+                if e.status == 202:
+                    logging.debug(f'create_adhoc(): 202, retried')
+                else:
+                    raise e
+        return pid
 
     async def execute_adhoc(self, pid, start, end, series):
         return await self.request('GET', f'/pipeline/{pid}?start={start}&end={end}&series={series}', 200)
@@ -273,17 +283,37 @@ class Tenant(Client):
         return await self.request('DELETE', f'/cq/dataset/{dsid}/pipeline/{plid}', 204)
 
     async def patch_dataset_data(self, dsid, ts, overwrite=False):
-        # TODO: 204 will return error
-        return await self.request('POST', f'/cq/dataset/{dsid}/task', 200, {
-            'ts': ts,
-            'overwrite': overwrite
-        })
+        while True:
+            try:
+                rlt = await self.request('POST', f'/cq/dataset/{dsid}/task', 200, {
+                    'ts': ts,
+                    'overwrite': overwrite
+                })
+                break
+            except UnexpectedStatus as e:
+                if e.status == 202:
+                    logging.debug(f'patch_dataset_data(): 202, retried')
+                elif e.status == 204:
+                    return {}
+                else:
+                    raise e
+        return rlt
 
-    async def poll_dataset_data(self, dsid, ts):
-        # TODO: 204 will throw error
-        return await self.request('POST', f'/cq/dataset/{dsid}/poll', 200, {
-            'ts': ts
-        })
+    async def poll_dataset_data(self, dsid, ts, allow_future):
+        while True:
+            try:
+                rlt = await self.request('POST', f'/cq/dataset/{dsid}/poll', 200, {
+                    'ts': ts
+                })
+                break
+            except UnexpectedStatus as e:
+                if e.status == 202:
+                    logging.debug(f'poll_dataset_data(): 202, retried')
+                elif e.status == 204 and allow_future:
+                    return {}
+                else:
+                    raise e
+        return rlt
 
     async def query_dataset_data(self, dsid, ts):
         return await self.request('GET', f'/cq/dataset/{dsid}/data?ts={ts}', 200)
@@ -295,21 +325,22 @@ def _aligh_date_range(ts, td, freq):
     freq_str = f"{freq}S"
     t1 = pd.Timestamp(ts).floor(freq_str)
     t2 = t1 + pd.Timedelta(freq_str if td is None else td)
-    dr = pd.date_range(start=t1, end=t2, freq=freq_str, closed='left')
+    dr = pd.date_range(start=t1, end=t2, freq=freq_str, inclusive='left')
     return dr
 
 def _translate_table(input, ts):
     output = []
-    for row in input:
-        _row = [ts]
-        for elem in row:
-            if type(elem) == list:
-                _row.append(tuple(elem))
-            elif type(elem) == str and elem.startswith('h:'):
-                _row.append(HyperLogLog(elem))
-            else:
-                _row.append(elem)
-        output.append(_row)
+    if isinstance(input, list): # handle None
+        for row in input:
+            _row = [ts]
+            for elem in row:
+                if type(elem) == list:
+                    _row.append(tuple(elem))
+                elif type(elem) == str and elem.startswith('h:'):
+                    _row.append(HyperLogLog(elem))
+                else:
+                    _row.append(elem)
+            output.append(_row)
     return output
 
 def _set_index(df, pipeline):
@@ -386,9 +417,12 @@ class Dataset:
 
     async def set_pipeline(self, plid, config):
         try:
-            pipe = await self.tenant.create_pipeline(self.dsid, plid, config)
-        except:
             pipe = await self.tenant.update_pipeline(self.dsid, plid, config)
+        except UnexpectedStatus as e:
+            if e.status == 404:
+                pipe = await self.tenant.create_pipeline(self.dsid, plid, config)
+            else:
+                raise e
         return Pipeline(self.tenant, self, plid, pipe['config'])
 
     async def del_pipeline(self, plid):
@@ -410,7 +444,7 @@ class Dataset:
         dr = _aligh_date_range(ts, td, self.conf['freq'])
         tasks = []
         for ts in dr:
-            coro = self.tenant.poll_dataset_data(self.dsid, ts.timestamp())
+            coro = self.tenant.poll_dataset_data(self.dsid, ts.timestamp(), True)
             tasks.append(asyncio.create_task(coro))
         rlts = await asyncio.gather(*tasks)
         return pd.DataFrame(rlts, index=dr)
@@ -439,14 +473,36 @@ class Dataset:
             dfd[pkey] = df
         return dfd
 
+    async def monitor_data(self, ts, coro):
+        freq_str = f"{self.conf['freq']}S"
+        next_ts = pd.Timestamp(ts).floor(freq_str)
+        delta = pd.Timedelta(freq_str)
+        return asyncio.create_task(self.monitor_loop(next_ts, delta, coro))
+
+    async def monitor_loop(self, next_ts, delta, coro):
+        while True:
+            try:
+                rlt = await self.tenant.poll_dataset_data(self.dsid, next_ts.timestamp(), False)
+                await coro(next_ts)
+                next_ts += delta
+            except UnexpectedStatus as e:
+                if e.status == 204:
+                    logging.debug(f'monitor_loop(): 204 for {next_ts}, retried')
+                    await asyncio.sleep(3)
+                else:
+                    raise e
+
 class Repository:
-    def __init__(self, url, account=None, password=None, ssl=True, burst=1, verbose=False):
+    def __init__(self, url, account=None, password=None, ssl=True, burst=1):
         if account is None:
             account = input('Account:')
         [user, tenant] = account.split('@')
         if password is None:
             password = getpass.getpass('Password:')
-        self.tenant = Tenant(url, user, tenant, password, ssl=ssl, burst=burst, verbose=verbose)
+        self.tenant = Tenant(url, user, tenant, password, ssl=ssl, burst=burst)
+
+    async def close(self):
+        await self.tenant.session.close()
 
     async def show_datasets(self):
         dset_list = await self.tenant.get_all_datasets()
@@ -466,9 +522,12 @@ class Repository:
 
     async def set_dataset(self, dsid, config):
         try:
-            desc = await self.tenant.create_dataset(dsid, config)
-        except:
             desc = await self.tenant.update_dataset(dsid, config)
+        except UnexpectedStatus as e:
+            if e.status == 404:
+                desc = await self.tenant.create_dataset(dsid, config)
+            else:
+                raise e
         return Dataset(self.tenant, dsid, desc['config'])
 
     async def del_dataset(self, dsid):
