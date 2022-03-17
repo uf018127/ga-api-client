@@ -1,16 +1,16 @@
-from src.ga_api_package.ga_api_client import Repository, Tenant
+from ga_api_package.ga_api_client import Repository, Tenant
 import asyncio
 import logging
 import pandas as pd
 
 async def open_main():
-    # return Repository('https://rdlab-214.genie-analytics.com/api', 'api@default', 'api123!@#', burst=1)
-    return Repository('http://192.168.11.214:3030/api', 'api@default', 'api123!@#', ssl=False, burst=1)
+    return Repository('https://rdlab-214.genie-analytics.com/api', 'api@default', 'api123!@#')
 
 async def exec_main(repo):
     async def tick(ts):
         nonlocal df
-        df_input = await pipe.query_data(ts, '5T')
+        dts = pd.date_range(ts, periods=1, freq='5T')
+        df_input = await pipe.read_data(dts)
         if len(df_input):
             df_input.columns = columns
             threshold = df.quantile(0.95)
@@ -55,12 +55,13 @@ async def exec_main(repo):
     # patch previous 48 hours data
     end = pd.Timestamp.now('+08:00').floor('5T') -  pd.Timedelta('5T')
     start = end - pd.Timedelta('48H')
-    await dset.patch_data(start, '48H')
+    dts = pd.date_range(start=start, end=end, freq='5T')
+    await dset.patch_data(dts)
 
     # monitor latest
     end = start + pd.Timedelta('24H')
-    df = await pipe.query_data(start, '24H')
-    df.columns = columns
+    dts = pd.date_range(start=start, end=end, freq='5T')
+    df = await pipe.read_data(dts, columns=columns)
     task = await dset.monitor_data(end, tick)
     await asyncio.gather(task);
 
@@ -69,7 +70,11 @@ async def close_main(repo):
     await asyncio.sleep(0.250)
 
 if __name__ == '__main__':
-    logging.basicConfig(format='▸ %(asctime)s %(filename)s:%(lineno)d %(levelname)s %(message)s', level=logging.INFO)
+    logging.basicConfig(
+        format='▸ %(asctime)s %(levelname)s %(filename)s:%(funcName)s:%(lineno)d - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        level=logging.WARNING
+    )
     loop = asyncio.get_event_loop()
     logging.info('Running the loop')
     try:

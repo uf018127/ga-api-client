@@ -1,9 +1,3 @@
-# Some Dataset/Pipeline API is required
-# - Append: open if exist, create if not exist
-#   - The problem is create throws error if exist
-# - Overwrite: delete if exist, then create
-#   - The problem is delete throws error if not exist
-
 import asyncio
 import os
 import time
@@ -12,9 +6,13 @@ import getpass
 import json
 import math
 import logging
+from unicodedata import name
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes # 36.0.0
 import aiohttp # 3.8.1
 import pandas as pd # 1.4.2
+
+def _logtime(ts):
+    return time.strftime("%H:%M:%S", time.localtime(ts))
 
 def pprint(value, indent=4, depth=0):
     if isinstance(value, dict):
@@ -71,7 +69,7 @@ def pprint(value, indent=4, depth=0):
 class UnexpectedStatus(Exception):
     def __init__(self, status, message):
         self.status = status
-        self.message = message
+        self.message = f'{status}: {message}'
         super().__init__(self.message)
 
 class HyperLogLog:
@@ -107,53 +105,47 @@ class HyperLogLog:
             E = -1*(2**32)*math.log(1-E*(2**(-32)));
         return int(round(E))
 
-AIO_TIMEOUT = 300
 ACCESS_TOKEN_TIMEOUT = 86400 / 2
 
-class ResponseError(Exception):
-    def __init__(self, text='') -> None:
-        super().__init__(text)
-
 class Client:
-    def __init__(self, url, user, tenant, password, ssl=True, burst=1):
+    def __init__(self, url, user, tenant, password, ssl=True, burst=1, retry=0):
         self.url = url # base url
         self.user = user # user name
         self.tenant = tenant # tenant name
         self.password = base64.b64encode(password.encode('utf-8')).decode() # base64 encoded password
-        self.ssl = ssl
-        self.sem = asyncio.Semaphore(burst)
-        self.headers = {
+        self.ssl = ssl # False to disable certificate verification
+        self.retry = retry
+        self._sem = asyncio.Semaphore(burst) # semaphone to throttle concurrent burst
+        self._headers = {
             'Content-Type': 'application/json'
         }
-        self.last_auth = 0
-        self.session = aiohttp.ClientSession()
+        self._last_auth = 0 # timestamp of last authenticate in seconds since Eopch
+        self._session = aiohttp.ClientSession()
 
-    async def authenticate(self):
-        if time.time() - self.last_auth < ACCESS_TOKEN_TIMEOUT:
-            return
+    async def _authenticate(self):
         authData = {
             'strategy': 'custom', # tells this is API request
             'account': f'{self.user}@{self.tenant}', # user account '<user>@<tenant>'
             'password': self.password # user password
         }
         # bringup
-        logging.debug(f'authenticate(): bringup')
+        logging.debug(f'bringup')
         url = self.url+f'/bringup?name={self.tenant}'
-        async with self.session.get(url, timeout=AIO_TIMEOUT, headers=self.headers, ssl=self.ssl) as resp:
+        async with self._session.get(url, headers=self._headers, ssl=self.ssl) as resp:
             if resp.status != 200:
                 text = await resp.text()
                 raise UnexpectedStatus(resp.status, text)
             bringup = await resp.json()
         # do captcha when enabled
         if bringup['captchaEnabled']:
-            logging.debug(f'authenticate(): captcha')
+            logging.debug(f'captcha')
             key = os.urandom(24)
             iv = os.urandom(16)
             data = {
                 'key': key.hex(),
                 'iv': iv.hex()
             }
-            async with self.session.post(self.url+'/captcha', json=data, timeout=AIO_TIMEOUT, headers=self.headers, ssl=self.ssl) as resp:
+            async with self._session.post(self.url+'/captcha', json=data, headers=self._headers, ssl=self.ssl) as resp:
                 if resp.status != 201:
                     text = await resp.text()
                     raise UnexpectedStatus(resp.status, text)
@@ -168,169 +160,326 @@ class Client:
                     'answer': answer_s
                 }
         # do authenticate
-        logging.debug(f'authenticate(): authenticate')
+        logging.debug(f'authenticate')
         url = self.url+'/authentication'
-        async with self.session.post(url, json=authData, timeout=AIO_TIMEOUT, headers=self.headers, ssl=self.ssl) as resp:
+        async with self._session.post(url, json=authData, headers=self._headers, ssl=self.ssl) as resp:
             if resp.status != 201:
                 text = await resp.text()
                 raise UnexpectedStatus(resp.status, text)
             body = await resp.json()
-            self.headers = {
+            self._headers = {
                 'Content-Type': 'application/json',
                 'Authorization': body['accessToken']
             }
-            self.last_auth = time.time()
+            self._last_auth = time.time()
 
-    async def request(self, method, path, code, data=None):
-        await self.authenticate()
-        async with self.sem:
+    async def _request(self, method, path, code, data=None):
+        if time.time() - self._last_auth >= ACCESS_TOKEN_TIMEOUT: # need to authenticate
+            retry_count = 0
             while True:
-                logging.debug(f'request(): {method} {path}')
-                async with self.session.request(method, self.url+path, json=data, timeout=AIO_TIMEOUT, headers=self.headers, ssl=self.ssl) as resp:
-                    if resp.status == code:
-                        if method != 'DELETE':
-                            return (await resp.json())['rlt']
-                        else:
-                            return None
-                    elif resp.status == 202:
-                        continue
+                try:
+                    await self._authenticate()
+                    break
+                except aiohttp.ClientError as e:
+                    if retry_count < self.retry: # user asks for retry
+                        retry_count += 1
+                        logging.warning(f'retry {retry_count}-th time')
                     else:
-                        text = await resp.text()
-                        raise UnexpectedStatus(resp.status, text)
+                        raise e
+        retry_count = 0
+        async with self._sem:
+            while True:
+                try:
+                    # logging.debug(f'{method} {path}')
+                    async with self._session.request(method, self.url+path, json=data, headers=self._headers, ssl=self.ssl) as resp:
+                        if resp.status in code: # expected status code
+                            if resp.status == 204:
+                                rlt = None
+                            else:
+                                rlt = (await resp.json())['rlt']
+                            return resp.status, rlt
+                        # We can not retry here because Poll Dataset Data will return 202 if there
+                        # are scheduled task. but we must retry here because if we release semaphone,
+                        # we don't know when we can acquire it again.
+                        elif resp.status == 202: # API server asks for retry
+                            continue
+                        else:
+                            text = await resp.text()
+                            raise UnexpectedStatus(resp.status, text)
+                except aiohttp.ClientError as e:
+                    if retry_count < self.retry: # user asks for retry
+                        retry_count += 1
+                        logging.warning(f'{method} {path}, retry {retry_count}')
+                    else:
+                        raise e
 
 class System(Client):
-    def __init__(self, url, user=None, password=None, ssl=True):
+    def __init__(self, url, user=None, password=None, ssl=True, retry=0):
+        """Construct object to send system requests.
+
+        Args:
+            url: The base url of API server.
+            user: The username.
+            password: The password.
+            ssl: `False` to relax certificate verification.
+            retry: Number of retry at network failure.
+        """
         if user is None:
             user = input('User:')
         if password is None:
             password = getpass.getpass('Password:')
-        super().__init__(url, user, 'system', password, ssl=ssl)
+        super().__init__(url, user, 'system', password, ssl=ssl, retry=retry)
 
     async def get_system(self):
-        return await self.request('GET', '/cq/config', 200)
+        """Get system config and status
+
+        Returns:
+            System descriptor. For example::
+
+            {
+                "config":{
+                    "burst":1,
+                    "retry":1,
+                    "maxTasks":65536
+                },
+                "status":{
+                    "created":"2022-02-17T10:18:06.714Z",
+                    "modified":"2022-03-14T17:44:46.717Z",
+                    "size":38,
+                    "maxId":36
+                }
+            }
+        """
+        # 200 - ok, return read system descriptor
+        _, rlt = await self._request('GET', '/cq/config', [200])
+        return rlt
 
     async def set_system(self, config):
-        return await self.request('PATCH', '/cq/config', 200, config)
+        """Set system config
+
+        Args:
+            config: The config part of system descriptor. See `System.get_system()`
+
+        Returns:
+            The modified system descriptor.
+        """
+        # 200 - ok, return modified system descriptor
+        _, rlt = await self._request('PATCH', '/cq/config', [200], config)
+        return rlt
 
     async def get_all_tenants(self):
-        return await self.request('GET', '/cq/config/tenant', 200)
+        """Gets config and status of all tenants.
+
+        Returns:
+            Dictionary of tenant descriptors indexed by tenant id.
+        """
+        # 200 - ok, return array of tenant descriptor
+        _, rlt = await self._request('GET', '/cq/config/tenant', [200])
+        return rlt
 
     async def get_tenant(self, tid):
-        return await self.request('GET', f'/cq/config/tenant/{tid}', 200)
+        """Get tenant config and status.
+
+        Args:
+            tid: The target tenant id
+
+        Returns:
+            Descriptor of the target tenant. For example::
+
+            {
+                "_id":0,
+                "config":{
+                    "limit":10000000000
+                },
+                "status":{
+                    "created":"2022-03-14T17:46:28.860Z",
+                    "modified":"2022-03-14T18:31:51.716Z",
+                    "size":0
+                }
+            }
+        """
+        # 200 - ok, return read tenant descriptor
+        status, rlt = await self._request('GET', f'/cq/config/tenant/{tid}', [200])
+        return rlt if status == 200 else None
 
     async def create_tenant(self, tid, config):
-        return await self.request('POST', f'/cq/config/tenant/{tid}', 200, config)
+        """Creates a new tenant
+
+        Args:
+            tid: The target tenant id
+            config: The config part of tenant descriptor. See `System.get_tenant()`
+
+        Returns:
+            Descriptor of the created tenant 
+        """
+        # 200 - ok, return created tenant descriptor
+        _, rlt = await self._request('POST', f'/cq/config/tenant/{tid}', [200], config)
+        return rlt
 
     async def update_tenant(self, tid, config):
-        return await self.request('PATCH', f'/cq/config/tenant/{tid}', 200, config)
+        """Updates tenant config
+
+        Args:
+            tid: The target tenant id
+            config: The config part of tenant descriptor. See `System.get_tenant()`
+
+        Returns:
+            Descriptor of the target tenant
+        """
+        # 200 - ok, return modified tenant descriptor
+        _, rlt = await self._request('PATCH', f'/cq/config/tenant/{tid}', [200], config)
+        return rlt
 
     async def delete_tenant(self, tid):
-        return await self.request('DELETE', f'/cq/config/tenant/{tid}', 204)
+        """Deletes tenant and its associated data.
+
+        Args:
+            tid: The target tenant id
+        """
+        # 204 - ok, return None
+        await self._request('DELETE', f'/cq/config/tenant/{tid}', [204])
 
 class Tenant(Client):
-    def __init__(self, url, user, tenant, password, ssl=True, burst=1):
-        super().__init__(url, user, tenant, password, ssl=ssl, burst=burst)
+    def __init__(self, url, user, tenant, password, ssl=True, burst=1, retry=0):
+        super().__init__(url, user, tenant, password, ssl=ssl, burst=burst, retry=retry)
 
     async def create_adhoc(self, pipeline):
-        while True:
-            try:
-                pid = await self.request('POST', '/pipeline', 201, pipeline)
-                break
-            except UnexpectedStatus as e:
-                if e.status == 202:
-                    logging.debug(f'create_adhoc(): 202, retried')
-                else:
-                    raise e
-        return pid
+        # 201 - ok, return adhoc id
+        status, rlt = await self._request('POST', '/pipeline', [201], pipeline)
+        logging.info(f'status={status} rlt={rlt}')
+        return rlt
 
     async def execute_adhoc(self, pid, start, end, series):
-        return await self.request('GET', f'/pipeline/{pid}?start={start}&end={end}&series={series}', 200)
+        # 200 - ok, return tabular data
+        # 202 - accepted, try again to get data
+        status, rlt = await self._request('GET', f'/pipeline/{pid}?start={start}&end={end}&series={series}', [200])
+        logging.info(f'status={status} pid={pid} start={_logtime(start)} end={_logtime(end)} series={series}')
+        return rlt if isinstance(rlt, list) else []
 
     async def get_all_datasets(self):
-        return await self.request('GET', '/cq/dataset', 200)
+        # 200 - ok, return array of dataset descriptor
+        status, rlt = await self._request('GET', '/cq/dataset', [200])
+        logging.info(f'status={status} rlt={rlt}')
+        return rlt
 
     async def delete_all_datasets(self):
-        return await self.request('DELETE', '/cq/dataset', 204)
+        # 204 - ok, return None
+        status, rlt = await self._request('DELETE', '/cq/dataset', [204])
+        logging.info(f'status={status} rlt={rlt}')
+        return rlt
 
     async def create_dataset(self, dsid, config):
-        return await self.request('POST', f'/cq/dataset/{dsid}', 200, config)
+        # 200 - ok, return created dataset descriptor
+        status, rlt = await self._request('POST', f'/cq/dataset/{dsid}', [200], config)
+        logging.info(f'status={status} dsid={dsid}')
+        return rlt
 
     async def get_dataset(self, dsid):
-        return await self.request('GET', f'/cq/dataset/{dsid}', 200)
+        # 200 - ok, return read dataset descriptor
+        status, rlt = await self._request('GET', f'/cq/dataset/{dsid}', [200])
+        logging.info(f'status={status} dsid={dsid}')
+        return rlt
 
     async def update_dataset(self, dsid, config):
-        return await self.request('PATCH', f'/cq/dataset/{dsid}', 200, config)
+        # 200 - ok, return modified dataset descriptor
+        # 404 - dataset not exist
+        status, rlt = await self._request('PATCH', f'/cq/dataset/{dsid}', [200], config)
+        logging.info(f'status={status} dsid={dsid}')
+        return rlt
 
     async def delete_dataset(self, dsid):
-        return await self.request('DELETE', f'/cq/dataset/{dsid}', 204)
+        # 204 - ok, return None
+        status, rlt = await self._request('DELETE', f'/cq/dataset/{dsid}', [204])
+        logging.info(f'status={status} dsid={dsid}')
+        return rlt
 
     async def get_all_pipelines(self, dsid):
-        return await self.request('GET', f'/cq/dataset/{dsid}/pipeline', 200)
+        # 200 - ok, return array of pipeline descriptors
+        status, rlt = await self._request('GET', f'/cq/dataset/{dsid}/pipeline', [200])
+        logging.info(f'status={status} dsid={dsid}')
+        return rlt
 
     async def delete_all_pipelines(self, dsid):
-        return await self.request('DELETE', f'/cq/dataset/{dsid}/pipeline', 204)
+        # 204 - ok, return None
+        status, rlt = await self._request('DELETE', f'/cq/dataset/{dsid}/pipeline', [204])
+        logging.info(f'status={status} dsid={dsid}')
+        return rlt
 
     async def create_pipeline(self, dsid, plid, config):
-        return await self.request('POST', f'/cq/dataset/{dsid}/pipeline/{plid}', 200, config)
+        # 200 - ok, return created pipeline descriptor
+        status, rlt = await self._request('POST', f'/cq/dataset/{dsid}/pipeline/{plid}', [200], config)
+        logging.info(f'status={status} dsid={dsid} plid={plid}')
+        return rlt
 
     async def get_pipeline(self, dsid, plid):
-        return await self.request('GET', f'/cq/dataset/{dsid}/pipeline/{plid}', 200)
+        # 200 - ok, return read pipeline descriptor
+        status, rlt = await self._request('GET', f'/cq/dataset/{dsid}/pipeline/{plid}', [200])
+        logging.info(f'status={status} dsid={dsid} plid={plid}')
+        return rlt
 
     async def update_pipeline(self, dsid, plid, config):
-        return await self.request('PATCH', f'/cq/dataset/{dsid}/pipeline/{plid}', 200, config)
+        # 200 - ok, return modified pipeline descriptor
+        status, rlt = await self._request('PATCH', f'/cq/dataset/{dsid}/pipeline/{plid}', [200], config)
+        logging.info(f'status={status} dsid={dsid} plid={plid}')
+        return rlt
 
     async def delete_pipeline(self, dsid, plid):
-        return await self.request('DELETE', f'/cq/dataset/{dsid}/pipeline/{plid}', 204)
+        # 204 - ok, return None
+        status, rlt = await self._request('DELETE', f'/cq/dataset/{dsid}/pipeline/{plid}', [204])
+        logging.info(f'status={status} dsid={dsid} plid={plid}')
+        return rlt
 
     async def patch_dataset_data(self, dsid, ts, overwrite=False):
-        while True:
-            try:
-                rlt = await self.request('POST', f'/cq/dataset/{dsid}/task', 200, {
-                    'ts': ts,
-                    'overwrite': overwrite
-                })
-                break
-            except UnexpectedStatus as e:
-                if e.status == 202:
-                    logging.debug(f'patch_dataset_data(): 202, retried')
-                elif e.status == 204:
-                    return {}
-                else:
-                    raise e
-        return rlt
+        # 200 - ok, return dict of patch result (1:data, 0:no data)
+        # 202 - accepted, try again to get data
+        # 204 - future, return None
+        # 400 - purged, return ??
+        status, rlt = await self._request('POST', f'/cq/dataset/{dsid}/task', [200, 204], {
+            'ts': ts,
+            'overwrite': overwrite
+        })
+        logging.info(f'status={status} dsid={dsid} ts={_logtime(ts)}')
+        return None if status != 200 else rlt
 
-    async def poll_dataset_data(self, dsid, ts, allow_future):
-        while True:
-            try:
-                rlt = await self.request('POST', f'/cq/dataset/{dsid}/poll', 200, {
-                    'ts': ts
-                })
-                break
-            except UnexpectedStatus as e:
-                if e.status == 202:
-                    logging.debug(f'poll_dataset_data(): 202, retried')
-                elif e.status == 204 and allow_future:
-                    return {}
-                else:
-                    raise e
-        return rlt
+    async def poll_dataset_data(self, dsid, ts):
+        # 200 - ok, return [<row>,...]
+        # 202 - scheduled task
+        # 204 - future, return None
+        status, rlt = await self._request('POST', f'/cq/dataset/{dsid}/poll', [200, 204], {
+            'ts': ts
+        })
+        logging.info(f'status={status} dsid={dsid} ts={_logtime(ts)}')
+        return None if status != 200 else rlt
 
     async def query_dataset_data(self, dsid, ts):
-        return await self.request('GET', f'/cq/dataset/{dsid}/data?ts={ts}', 200)
+        # 200 - ok, return dictionary of [<row>,...], key is str(plid)
+        _, rlt = await self._request('GET', f'/cq/dataset/{dsid}/data?ts={ts}', [200])
+        return rlt if isinstance(rlt, dict) else {}
 
     async def query_pipeline_data(self, dsid, plid, ts):
-        return await self.request('GET', f'/cq/dataset/{dsid}/pipeline/{plid}/data?ts={ts}', 200)
+        # 200 - ok, return [<row>,...]
+        status, rlt = await self._request('GET', f'/cq/dataset/{dsid}/pipeline/{plid}/data?ts={ts}', [200])
+        logging.info(f'status={status} dsid={dsid} plid={plid} ts={_logtime(ts)}')
+        return rlt if isinstance(rlt, list) else []
 
-def _aligh_date_range(ts, td, freq):
-    freq_str = f"{freq}S"
-    t1 = pd.Timestamp(ts).floor(freq_str)
-    t2 = t1 + pd.Timedelta(freq_str if td is None else td)
-    dr = pd.date_range(start=t1, end=t2, freq=freq_str, inclusive='left')
-    return dr
+def _compute_ncol(pipeline):
+    ncol = 0
+    if 'bucket' in pipeline:
+        for bkt in pipeline['bucket']:
+            if bkt[0] in ['$distinctTuple','enumTuple']:
+                # each field introduce one key column
+                ncol += len(bkt[1]['fields'])
+            else:
+                # each tier introduce one key column
+                ncol += 1
+    if 'metric' in pipeline:
+        # each metric introduce two columns
+        ncol += len(pipeline['metric']) * 2
+    return ncol
 
-def _translate_table(input, ts):
-    output = []
-    if isinstance(input, list): # handle None
+def _translate_table(input, ts, ncol):
+    if isinstance(input, list):
+        output = []
         for row in input:
             _row = [ts]
             for elem in row:
@@ -341,68 +490,123 @@ def _translate_table(input, ts):
                 else:
                     _row.append(elem)
             output.append(_row)
-    return output
-
-def _set_index(df, pipeline):
-    nkey = 0
-    if 'bucket' in pipeline:
-        for bkt in pipeline['bucket']:
-            if bkt[0] in ['$distinctTuple', '$enumTuple']:
-                nkey += len(bkt[1]['fields'])
-            else:
-                nkey += 1
-    return df.set_index(list(range(nkey+1)))
+        return output
+    else: # None or Exception
+        return []
 
 class Adhoc:
-    def __init__(self, tenant, freq, pipeline):
-        self.tenant = tenant # client to connect API server
-        self.freq = freq # frequency in seconds
-        self.pipeline = pipeline # pipeline object
+    @staticmethod
+    async def _create(tenant, freq, pipeline):
+        """Create Adhoc object to send adhoc request
 
-    async def query_data(self, ts, td, series):
-        dr = _aligh_date_range(ts, td, self.freq)
-        pid = await self.tenant.create_adhoc(self.pipeline)
+        Args:
+            tenant: tenant object to access API server
+            freq: frequency in seconds
+            pipeline: pipeline object
+
+        Returns:
+            The created Adhoc object.
+        """
+        self = Adhoc()
+        self._tenant = tenant
+        self.freq = freq
+        self.pipeline = pipeline # pipeline object
+        self.pid = await self._tenant.create_adhoc(self.pipeline)
+        return self
+
+    async def read_data(self, dts, series, columns=None, refresh=True):
+        """Execute adhoc request and read its data
+
+        Args:
+            dts: pandas.DatetimeIndex or array-like.
+            series: 'full', 'hour' or 'day'.
+            columns: column labels of frame. Defaults to None.
+            refresh: refresh adhoc on API server. Defaults to True.
+
+        Returns:
+            The adhoc data frame.
+        """
+        if refresh:
+            await self._tenant.create_adhoc(self.pipeline)
         tasks = []
-        delta = pd.Timedelta(f'{self.freq}S')
-        for ts in dr:
-            start = ts.timestamp()
-            end = (ts + delta).timestamp()
-            coro = self.tenant.execute_adhoc(pid, start, end, series)
+        tsidx = []
+        freq_str = f"{self.freq}S"
+        delta = pd.Timedelta(freq_str)
+        for ts in dts:
+            start = ts.floor(freq_str)
+            end = start + delta
+            coro = self._tenant.execute_adhoc(self.pid, start.timestamp(), end.timestamp(), series)
             tasks.append(asyncio.create_task(coro))
-        rlts = await asyncio.gather(*tasks)
+            tsidx.append(start)
+        rlts = await asyncio.gather(*tasks, return_exceptions=True)
         data = []
-        for ts, rlt in zip(dr, rlts):
-            tls = _translate_table(rlt, ts)
+        ncol = _compute_ncol(self.pipeline)
+        for ts, rlt in zip(tsidx, rlts):
+            tls = _translate_table(rlt, ts, ncol)
             data.extend(tls)
-        return pd.DataFrame(data)
+        return pd.DataFrame(data, columns=columns)
 
 class Pipeline:
     def __init__(self, tenant, dset, plid, conf):
-        self.tenant = tenant
-        self.dset = dset
+        """Construct pipeline object to send pipeline requests.
+
+        Args:
+            tenant: tenant object to access API server
+            dset: parent dataset object.
+            plid: pipeline ID
+            conf: pipeline config
+        """
+        self._tenant = tenant
+        self._dset = dset
         self.plid = plid
         self.conf = conf
 
-    async def query_data(self, ts, td):
-        dr = _aligh_date_range(ts, td, self.dset.conf['freq'])
+    async def read_data(self, dts, columns=None):
+        """Read pipeline data on API server.
+
+        Args:
+            dts: pandas.DatetimeIndex or array-like.
+            columns: Column labels of frame. Defaults to None.
+
+        Returns:
+            The pipeline data frame.
+        """
         tasks = []
-        for ts in dr:
-            coro = self.tenant.query_pipeline_data(self.dset.dsid, self.plid, ts.timestamp())
+        tsidx = []
+        freq_str = f"{self._dset.conf['freq']}S"
+        for ts in dts:
+            start = ts.floor(freq_str)
+            coro = self._tenant.query_pipeline_data(self._dset.dsid, self.plid, start.timestamp())
             tasks.append(asyncio.create_task(coro))
-        rlts = await asyncio.gather(*tasks)
+            tsidx.append(start)
+        rlts = await asyncio.gather(*tasks, return_exceptions=True)
         data = []
-        for ts, rlt in zip(dr, rlts):
-            data += _translate_table(rlt, ts)
-        return pd.DataFrame(data)
+        ncol = _compute_ncol(self.conf['pipeline'])
+        for ts, rlt in zip(tsidx, rlts):
+            tls = _translate_table(rlt, ts, ncol)
+            data.extend(tls)
+        return pd.DataFrame(data, columns=columns)
 
 class Dataset:
     def __init__(self, tenant, dsid, conf):
-        self.tenant = tenant
+        """Construct dataset object to send dataset requests. Don't call directly.
+
+        Args:
+            tenant: tenant object to access API server
+            dsid: dataset id
+            conf: dataset config
+        """
+        self._tenant = tenant
         self.dsid = dsid
         self.conf = conf
 
     async def show_pipelines(self):
-        pipe_list = await self.tenant.get_all_pipelines(self.dsid)
+        """Get the config of all pipelines.
+
+        Returns:
+            dict of pipeline config indexed by pipeline id.
+        """
+        pipe_list = await self._tenant.get_all_pipelines(self.dsid)
         pipe_dict = {}
         for pipe in pipe_list:
             item = pipe['config'].copy()
@@ -411,101 +615,154 @@ class Dataset:
             pipe_dict[pipe['_id']] = item
         return pd.DataFrame.from_dict(pipe_dict, orient='index')
 
+    async def del_all_pipelines(self):
+        """Delete all pipelines of this dataset.
+        """
+        await self._tenant.delete_all_pipelines(self.dsid)
+
     async def get_pipeline(self, plid):
-        pipe = await self.tenant.get_pipeline(self.dsid, plid)
-        return Pipeline(self.tenant, self, plid, pipe['config'])
+        """Get the specified pipeline.
+
+        Args:
+            plid (int): pipeline id
+
+        Returns:
+            The pipeline object with the specified id
+        """
+        pipe = await self._tenant.get_pipeline(self.dsid, plid)
+        return Pipeline(self._tenant, self, plid, pipe['config'])
 
     async def set_pipeline(self, plid, config):
+        """Open the specified pipeline. The pipeline is created if it does not
+        exist.
+
+        Args:
+            plid: pipeline id
+            config: pipeline config.
+
+        Returns:
+            The pipeline object
+        """
         try:
-            pipe = await self.tenant.update_pipeline(self.dsid, plid, config)
+            pipe = await self._tenant.update_pipeline(self.dsid, plid, config)
         except UnexpectedStatus as e:
             if e.status == 404:
-                pipe = await self.tenant.create_pipeline(self.dsid, plid, config)
+                pipe = await self._tenant.create_pipeline(self.dsid, plid, config)
             else:
                 raise e
-        return Pipeline(self.tenant, self, plid, pipe['config'])
+        return Pipeline(self._tenant, self, plid, pipe['config'])
 
     async def del_pipeline(self, plid):
-        await self.tenant.delete_pipeline(self.dsid, plid)
+        """Delete the specified pipeline.
 
-    async def del_all_pipelines(self):
-        await self.tenant.delete_all_pipelines(self.dsid)
+        Args:
+            plid: pipeline id
+        """
+        await self._tenant.delete_pipeline(self.dsid, plid)
 
-    async def patch_data(self, ts, td, overwrite=False):
-        dr = _aligh_date_range(ts, td, self.conf['freq'])
+    async def patch_data(self, dts, overwrite=False):
+        """Patch dataset data
+
+        Args:
+            dts: pandas.DatetimeIndex or array-like.
+            overwrite: True to force overwrite data on API server. Defaults to False.
+
+        Returns:
+            Patch result in frame.
+        """
+        freq_str = f"{self.conf['freq']}S"
         tasks = []
-        for ts in dr:
-            coro = self.tenant.patch_dataset_data(self.dsid, ts.timestamp(), overwrite)
+        tsidx = []
+        for ts in dts:
+            start = ts.floor(freq_str)
+            coro = self._tenant.patch_dataset_data(self.dsid, start.timestamp(), overwrite)
             tasks.append(asyncio.create_task(coro))
-        rlts = await asyncio.gather(*tasks)
-        return pd.DataFrame(rlts, index=dr)
+            tsidx.append(start)
+        rlts = await asyncio.gather(*tasks, return_exceptions=True)
+        rlts = [elem if isinstance(elem, dict) else {} for elem in rlts]
+        return pd.DataFrame(rlts, index=pd.Index(dts, name='timestamp'))
 
-    async def poll_data(self, ts, td):
-        dr = _aligh_date_range(ts, td, self.conf['freq'])
-        tasks = []
-        for ts in dr:
-            coro = self.tenant.poll_dataset_data(self.dsid, ts.timestamp(), True)
-            tasks.append(asyncio.create_task(coro))
-        rlts = await asyncio.gather(*tasks)
-        return pd.DataFrame(rlts, index=dr)
+    async def poll_data(self, dts):
+        """Check dataset data availability.
 
-    async def query_data(self, ts, td):
-        pipe_list = await self.tenant.get_all_pipelines(self.dsid)
-        pipe_dict = {pipe['_id']: pipe['config']['pipeline'] for pipe in pipe_list}
-        dr = _aligh_date_range(ts, td, self.conf['freq'])
+        Args:
+            dts: pandas.DatetimeIndex or array-like.
+
+        Returns:
+            Patch result in frame.
+        """
+        freq_str = f"{self.conf['freq']}S"
         tasks = []
-        for ts in dr:
-            coro = self.tenant.query_dataset_data(self.dsid, ts.timestamp())
+        tsidx = []
+        for ts in dts:
+            start = ts.floor(freq_str)
+            coro = self._tenant.poll_dataset_data(self.dsid, start.timestamp())
             tasks.append(asyncio.create_task(coro))
-        rlts = await asyncio.gather(*tasks)
-        data = {}
-        for ts, rlt in zip(dr, rlts):
-            for pkey, pdat in rlt.items():
-                tls = _translate_table(pdat, ts)
-                if pkey not in data:
-                    data[pkey] = tls
-                else:
-                    data[pkey].extend(tls)
-        dfd = {}
-        for pkey, pdat in data.items():
-            # the strange type casting is caused by using pid as object key
-            df = pd.DataFrame(pdat), pipe_dict[int(pkey)]
-            dfd[pkey] = df
-        return dfd
+            tsidx.append(start)
+        rlts = await asyncio.gather(*tasks, return_exceptions=True)
+        rlts = [elem if isinstance(elem, dict) else {} for elem in rlts]
+        return pd.DataFrame(rlts, index=pd.Index(tsidx, name='timestamp'))
 
     async def monitor_data(self, ts, coro):
+        """Create a task to monitor dataset data.
+
+        Args:
+            ts: start time in pandas.Timestamp
+            coro: coroutine to handle new data
+
+        Returns:
+            The created task
+        """
         freq_str = f"{self.conf['freq']}S"
         next_ts = pd.Timestamp(ts).floor(freq_str)
         delta = pd.Timedelta(freq_str)
-        return asyncio.create_task(self.monitor_loop(next_ts, delta, coro))
+        return asyncio.create_task(self._monitor_loop(next_ts, delta, coro))
 
-    async def monitor_loop(self, next_ts, delta, coro):
+    async def _monitor_loop(self, next_ts, delta, coro):
         while True:
-            try:
-                rlt = await self.tenant.poll_dataset_data(self.dsid, next_ts.timestamp(), False)
-                await coro(next_ts)
-                next_ts += delta
-            except UnexpectedStatus as e:
-                if e.status == 204:
-                    logging.debug(f'monitor_loop(): 204 for {next_ts}, retried')
-                    await asyncio.sleep(3)
-                else:
-                    raise e
+            rlt = await self._tenant.poll_dataset_data(self.dsid, next_ts.timestamp())
+            if rlt is None: # 204
+                logging.debug(f'204 for {next_ts}, retried')
+                await asyncio.sleep(3)
+                continue
+            await coro(next_ts)
+            next_ts += delta
 
 class Repository:
-    def __init__(self, url, account=None, password=None, ssl=True, burst=1):
+    def __init__(self, url:str, account:str=None, password:str=None, ssl:bool=True, burst:int=1, retry:int=0):
+        """Construct repository object to send tenant requests to API server
+
+        Args:
+            url (str): The base URL of API server.
+            account (str, optional): The user account in '<username>@<tenant_name>' format. If this
+            argument is missing, the client will ask the user to input it interactively.
+            password (str, optional): The user password. If this argument is missing, the client
+            will ask the user to input it interactively.
+            ssl (bool, optional): Set False to relax certification checks for self signed API server.
+            Defaults to True.
+            burst (int, optional): Maximum concurrent requests to the API server. Defaults to 1.
+            retry (int, optional): Number of retry at fail of sending request. Defaults to 0.
+        """
         if account is None:
             account = input('Account:')
         [user, tenant] = account.split('@')
         if password is None:
             password = getpass.getpass('Password:')
-        self.tenant = Tenant(url, user, tenant, password, ssl=ssl, burst=burst)
+        self._tenant = Tenant(url, user, tenant, password, ssl=ssl, burst=burst, retry=retry)
 
     async def close(self):
-        await self.tenant.session.close()
+        """Close the underlying connections gracefully. If the event loop is stopped before
+        the repository is closed, a ResourceWarning: unclosed transport warning is emitted.
+        """
+        await self._tenant._session.close()
 
     async def show_datasets(self):
-        dset_list = await self.tenant.get_all_datasets()
+        """Get the configurations of all datasets.
+
+        Returns:
+            pandas.DataFrame: Dataset configurations indexed by dataset id.
+        """
+        dset_list = await self._tenant.get_all_datasets()
         dset_dict = {}
         for dset in dset_list:
             item = dset['config'].copy()
@@ -514,24 +771,57 @@ class Repository:
         return pd.DataFrame.from_dict(dset_dict, orient='index')
 
     async def del_all_datasets(self):
-        await self.tenant.delete_all_datasets()
+        """Delete all datasets of this tenant.
+        """
+        await self._tenant.delete_all_datasets()
 
-    async def get_dataset(self, dsid):
-        desc = await self.tenant.get_dataset(dsid)
-        return Dataset(self.tenant, dsid, desc['config'])
+    async def get_dataset(self, dsid:int):
+        """Get the specified dataset.
 
-    async def set_dataset(self, dsid, config):
+        Args:
+            dsid: dataset id
+
+        Returns:
+            Dataset: The Dataset object
+        """
+        desc = await self._tenant.get_dataset(dsid)
+        return Dataset(self._tenant, dsid, desc['config'])
+
+    async def set_dataset(self, dsid:int, config:dict):
+        """Update the specified dataset, or create it if not exist.
+
+        Args:
+            dsid: dataset id
+            config: dataset config
+
+        Returns:
+            The created or updated dataset object
+        """
         try:
-            desc = await self.tenant.update_dataset(dsid, config)
+            desc = await self._tenant.update_dataset(dsid, config)
         except UnexpectedStatus as e:
             if e.status == 404:
-                desc = await self.tenant.create_dataset(dsid, config)
+                desc = await self._tenant.create_dataset(dsid, config)
             else:
                 raise e
-        return Dataset(self.tenant, dsid, desc['config'])
+        return Dataset(self._tenant, dsid, desc['config'])
 
-    async def del_dataset(self, dsid):
-        await self.tenant.delete_dataset(dsid)
+    async def del_dataset(self, dsid:int):
+        """Delete the specified dataset.
 
-    async def set_adhoc(self, freq, pipeline):
-        return Adhoc(self.tenant, freq, pipeline)
+        Args:
+            dsid: The dataset id
+        """
+        await self._tenant.delete_dataset(dsid)
+
+    async def set_adhoc(self, freq:int, pipeline:dict):
+        """Create an Adhoc Object.
+
+        Args:
+            freq: the aggregate frequency in seconds between 60 to 3600.
+            pipeline: the pipeline
+
+        Returns:
+            Adhoc: The Adhoc object
+        """
+        return await Adhoc._create(self._tenant, freq, pipeline)
