@@ -88,7 +88,7 @@ class HyperLogLog:
         return HyperLogLog(bytes(max(a,b) for a, b in zip(self._rmem, other._rmem)))
 
     def __str__(self):
-        return '<HyperLogLog>'
+        return f'h:{self.value()}'
 
     def value(self):
         N = 1 << 11
@@ -129,7 +129,7 @@ class Client:
             'password': self.password # user password
         }
         # bringup
-        logging.debug(f'bringup')
+        logging.info(f'bringup')
         url = self.url+f'/bringup?name={self.tenant}'
         async with self._session.get(url, headers=self._headers, ssl=self.ssl) as resp:
             if resp.status != 200:
@@ -138,7 +138,7 @@ class Client:
             bringup = await resp.json()
         # do captcha when enabled
         if bringup['captchaEnabled']:
-            logging.debug(f'captcha')
+            logging.info(f'captcha')
             key = os.urandom(24)
             iv = os.urandom(16)
             data = {
@@ -160,7 +160,7 @@ class Client:
                     'answer': answer_s
                 }
         # do authenticate
-        logging.debug(f'authenticate')
+        logging.info(f'authenticate')
         url = self.url+'/authentication'
         async with self._session.post(url, json=authData, headers=self._headers, ssl=self.ssl) as resp:
             if resp.status != 201:
@@ -205,6 +205,7 @@ class Client:
                             continue
                         else:
                             text = await resp.text()
+                            logging.error(f'status={resp.status} message={text}')
                             raise UnexpectedStatus(resp.status, text)
                 except aiohttp.ClientError as e:
                     if retry_count < self.retry: # user asks for retry
@@ -729,25 +730,24 @@ class Dataset:
             next_ts += delta
 
 class Repository:
-    def __init__(self, url:str, account:str=None, password:str=None, ssl:bool=True, burst:int=1, retry:int=0):
+    def __init__(self, url, user=None, tenant=None, password=None, ssl=True, burst=1, retry=0):
         """Construct repository object to send tenant requests to API server
 
         Args:
-            url (str): The base URL of API server.
-            account (str, optional): The user account in '<username>@<tenant_name>' format. If this
-            argument is missing, the client will ask the user to input it interactively.
-            password (str, optional): The user password. If this argument is missing, the client
-            will ask the user to input it interactively.
-            ssl (bool, optional): Set False to relax certification checks for self signed API server.
-            Defaults to True.
-            burst (int, optional): Maximum concurrent requests to the API server. Defaults to 1.
-            retry (int, optional): Number of retry at fail of sending request. Defaults to 0.
+            url: The base URL of API server.
+            user: The user name.
+            tenant: The tenant name.
+            password: The user password.
+            ssl: Set False to relax certification checks for self signed API server. Defaults to True.
+            burst: Maximum concurrent requests to the API server.
+            retry: Number of retry at fail of sending request.
         """
-        if account is None:
-            account = input('Account:')
-        [user, tenant] = account.split('@')
+        if user is None:
+            user = input('User:')
+        if tenant is None:
+            tenant = input('Tenant:')
         if password is None:
-            password = getpass.getpass('Password:')
+            password = getpass.getpass('User Password:')
         self._tenant = Tenant(url, user, tenant, password, ssl=ssl, burst=burst, retry=retry)
 
     async def close(self):
@@ -755,6 +755,7 @@ class Repository:
         the repository is closed, a ResourceWarning: unclosed transport warning is emitted.
         """
         await self._tenant._session.close()
+        await asyncio.sleep(0.250)
 
     async def show_datasets(self):
         """Get the configurations of all datasets.
