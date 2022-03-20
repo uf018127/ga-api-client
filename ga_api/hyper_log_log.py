@@ -1,3 +1,5 @@
+import math
+
 class HyperLogLog:
     def __init__(self, arg=None):
         if arg is None: # zero

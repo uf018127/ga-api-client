@@ -1,16 +1,15 @@
 import asyncio
-from asyncore import loop
+import itertools
 import os
 import time
 import base64
 import getpass
 import json
-import math
 import logging
-from unicodedata import name
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes # 36.0.0
 import aiohttp # 3.8.1
 import pandas as pd # 1.4.2
+from .hyper_log_log import HyperLogLog
 
 def _logtime(ts):
     return time.strftime("%H:%M:%S", time.localtime(ts))
@@ -161,11 +160,13 @@ class Client:
                     # logging.debug(f'{method} {path}')
                     async with self._session.request(method, self.url+path, json=data, headers=self._headers, ssl=self.ssl) as resp:
                         if resp.status in code: # expected status code
-                            if resp.status == 204:
-                                rlt = None
-                            else:
-                                rlt = (await resp.json())['rlt']
+                            rlt = None
+                            if resp.content_type == 'application/json':
+                                data = await resp.json()
+                                if 'rlt' in data:
+                                    rlt = data['rlt']
                             return resp.status, rlt
+                        # resp.headers[aiohttp.hdrs.CONTENT_TYPE] == 'application/json':
                         # We can not retry here because Poll Dataset Data will return 202 if there
                         # are scheduled task. but we must retry here because if we release semaphone,
                         # we don't know when we can acquire it again.
@@ -358,15 +359,17 @@ class Tenant(Client):
 
     async def update_dataset(self, dsid, config):
         # 200 - ok, return modified dataset descriptor
-        # 404 - dataset not exist
         status, rlt = await self._request('PATCH', f'/cq/dataset/{dsid}', [200], config)
         logging.info(f'status={status} dsid={dsid}')
         return rlt
 
-    async def delete_dataset(self, dsid):
+    async def delete_dataset(self, dsid, missing_ok=False):
         # 204 - ok, return None
-        status, rlt = await self._request('DELETE', f'/cq/dataset/{dsid}', [204])
-        logging.info(f'status={status} dsid={dsid}')
+        # 404 - error, dataset not found
+        code = [204, 404] if missing_ok else [204]
+        status, rlt = await self._request('DELETE', f'/cq/dataset/{dsid}', code)
+        if status != 404 or not missing_ok:
+            logging.info(f'status={status} dsid={dsid}')
         return rlt
 
     async def get_all_pipelines(self, dsid):
@@ -399,10 +402,13 @@ class Tenant(Client):
         logging.info(f'status={status} dsid={dsid} plid={plid}')
         return rlt
 
-    async def delete_pipeline(self, dsid, plid):
+    async def delete_pipeline(self, dsid, plid, missing_ok=False):
         # 204 - ok, return None
-        status, rlt = await self._request('DELETE', f'/cq/dataset/{dsid}/pipeline/{plid}', [204])
-        logging.info(f'status={status} dsid={dsid} plid={plid}')
+        # 404 - error, pipeline not found
+        code = [204, 404] if missing_ok else [204]
+        status, rlt = await self._request('DELETE', f'/cq/dataset/{dsid}/pipeline/{plid}', code)
+        if status != 404 or not missing_ok:
+            logging.info(f'status={status} dsid={dsid} plid={plid}')
         return rlt
 
     async def patch_dataset_data(self, dsid, ts, overwrite=False):
@@ -453,22 +459,31 @@ def _compute_ncol(pipeline):
         ncol += len(pipeline['metric']) * 2
     return ncol
 
-def _translate_table(input, ts, ncol):
-    if isinstance(input, list):
-        output = []
-        for row in input:
-            _row = [ts]
-            for elem in row:
+class _translate_table:
+    def __init__(self, table, ts):
+        self.table = table if isinstance(table, list) else []
+        self.ts = ts
+
+    def __iter__(self):
+        for input_row in self.table:
+            output_row = [] if self.ts is None else [self.ts]
+            for elem in input_row:
                 if type(elem) == list:
-                    _row.append(tuple(elem))
+                    output_row.append(tuple(elem))
                 elif type(elem) == str and elem.startswith('h:'):
-                    _row.append(HyperLogLog(elem))
+                    output_row.append(HyperLogLog(elem))
                 else:
-                    _row.append(elem)
-            output.append(_row)
-        return output
-    else: # None or Exception
-        return []
+                    output_row.append(elem)
+            yield output_row
+
+class _translate_rlts:
+    def __init__(self, tsidx, rlts):
+        self.tsidx = tsidx
+        self.rlts = rlts
+
+    def __iter__(self):
+        for ts, rlt in zip(self.tsidx, self.rlts):
+            yield _translate_table(rlt, ts)
 
 class Adhoc:
     @staticmethod
@@ -490,18 +505,17 @@ class Adhoc:
         self.pid = await self._tenant.create_adhoc(self.pipeline)
         return self
 
-    async def read_data(self, dts, series, columns=None, refresh=True):
-        """Execute adhoc request and read its data
+    async def _read_point(self, ts, series, columns=None, refresh=True):
+        if refresh:
+            await self._tenant.create_adhoc(self.pipeline)
+        freq_str = f"{self.freq}S"
+        delta = pd.Timedelta(freq_str)
+        start = pd.Timestamp(ts).floor(freq_str)
+        end = start + delta
+        table = await self._tenant.execute_adhoc(self.pid, start.timestamp(), end.timestamp(), series)
+        return pd.DataFrame(_translate_table(table, None), columns=columns)
 
-        Args:
-            dts: pandas.DatetimeIndex or array-like.
-            series: 'full', 'hour' or 'day'.
-            columns: column labels of frame. Defaults to None.
-            refresh: refresh adhoc on API server. Defaults to True.
-
-        Returns:
-            The adhoc data frame.
-        """
+    async def _read_range(self, dts, series, columns=None, refresh=True):
         if refresh:
             await self._tenant.create_adhoc(self.pipeline)
         tasks = []
@@ -515,12 +529,29 @@ class Adhoc:
             tasks.append(asyncio.create_task(coro))
             tsidx.append(start)
         rlts = await asyncio.gather(*tasks, return_exceptions=True)
-        data = []
-        ncol = _compute_ncol(self.pipeline)
-        for ts, rlt in zip(tsidx, rlts):
-            tls = _translate_table(rlt, ts, ncol)
-            data.extend(tls)
-        return pd.DataFrame(data, columns=columns)
+        iter = itertools.chain.from_iterable(_translate_rlts(tsidx, rlts))
+        return pd.DataFrame(iter, columns=columns)
+
+    async def read_data(self, dts, *args, **kwargs):
+        """Execute adhoc request and read its data
+
+        Args:
+            dts: pandas.Timestamp, pandas.DatetimeIndex or array-like.
+            series: 'full', 'hour' or 'day'.
+            columns: column labels of frame. Defaults to None.
+            refresh: refresh adhoc on API server. Defaults to True.
+
+        Returns:
+            The adhoc data frame.
+        """
+        try:
+            ts = pd.Timestamp(dts)
+        except:
+            ts = None
+        if ts is None:
+            return await self._read_range(dts, *args, **kwargs)
+        else:
+            return await self._read_point(ts, *args, **kwargs)
 
 class Pipeline:
     def __init__(self, tenant, dset, plid, conf):
@@ -537,16 +568,13 @@ class Pipeline:
         self.plid = plid
         self.conf = conf
 
-    async def read_data(self, dts, columns=None):
-        """Read pipeline data on API server.
+    async def _read_point(self, ts, columns=None):
+        freq_str = f"{self._dset.conf['freq']}S"
+        start = ts.floor(freq_str)
+        table = await self._tenant.query_pipeline_data(self._dset.dsid, self.plid, start.timestamp())
+        return pd.DataFrame(_translate_table(table, None), columns=columns)
 
-        Args:
-            dts: pandas.DatetimeIndex or array-like.
-            columns: Column labels of frame. Defaults to None.
-
-        Returns:
-            The pipeline data frame.
-        """
+    async def _read_range(self, dts, columns=None):
         tasks = []
         tsidx = []
         freq_str = f"{self._dset.conf['freq']}S"
@@ -556,12 +584,27 @@ class Pipeline:
             tasks.append(asyncio.create_task(coro))
             tsidx.append(start)
         rlts = await asyncio.gather(*tasks, return_exceptions=True)
-        data = []
-        ncol = _compute_ncol(self.conf['pipeline'])
-        for ts, rlt in zip(tsidx, rlts):
-            tls = _translate_table(rlt, ts, ncol)
-            data.extend(tls)
-        return pd.DataFrame(data, columns=columns)
+        iter = itertools.chain.from_iterable(_translate_rlts(tsidx, rlts))
+        return pd.DataFrame(iter, columns=columns)
+
+    async def read_data(self, dts, *args, **kwargs):
+        """Read pipeline data on API server.
+
+        Args:
+            dts: pandas.Timestamp, pandas.DatetimeIndex or array-like.
+            columns: Column labels of frame. Defaults to None.
+
+        Returns:
+            The pipeline data frame.
+        """
+        try:
+            ts = pd.Timestamp(dts)
+        except:
+            ts = None
+        if ts is None:
+            return await self._read_range(dts, *args, **kwargs)
+        else:
+            return await self._read_point(ts, *args, **kwargs)
 
 class Dataset:
     def __init__(self, tenant, dsid, conf):
@@ -596,21 +639,26 @@ class Dataset:
         """
         await self._tenant.delete_all_pipelines(self.dsid)
 
-    async def get_pipeline(self, plid):
-        """Get the specified pipeline.
+    async def get_pipeline(self, plid, config=None):
+        """Get the specified pipeline, or optionally create it if not exist.
 
         Args:
             plid (int): pipeline id
+            config: optional config to create pipeline
 
         Returns:
             The pipeline object with the specified id
         """
-        pipe = await self._tenant.get_pipeline(self.dsid, plid)
+        try:
+            pipe = await self._tenant.get_pipeline(self.dsid, plid)
+        except UnexpectedStatus as e:
+            if e.status != 404 or config is None:
+                raise e
+            pipe = await self._tenant.create_pipeline(self.dsid, plid, config)
         return Pipeline(self._tenant, self, plid, pipe['config'])
 
     async def set_pipeline(self, plid, config):
-        """Open the specified pipeline. The pipeline is created if it does not
-        exist.
+        """Update the specified pipeline.
 
         Args:
             plid: pipeline id
@@ -622,19 +670,19 @@ class Dataset:
         try:
             pipe = await self._tenant.update_pipeline(self.dsid, plid, config)
         except UnexpectedStatus as e:
-            if e.status == 404:
-                pipe = await self._tenant.create_pipeline(self.dsid, plid, config)
-            else:
+            if e.status != 404:
                 raise e
+            pipe = await self._tenant.create_pipeline(self.dsid, plid, config)
         return Pipeline(self._tenant, self, plid, pipe['config'])
 
-    async def del_pipeline(self, plid):
+    async def del_pipeline(self, plid, missing_ok=False):
         """Delete the specified pipeline.
 
         Args:
             plid: pipeline id
+            missing_ok: True to ignore pipeline not found.
         """
-        await self._tenant.delete_pipeline(self.dsid, plid)
+        await self._tenant.delete_pipeline(self.dsid, plid, missing_ok)
 
     async def patch_data(self, dts, overwrite=False):
         """Patch dataset data
@@ -751,20 +799,26 @@ class Repository:
         """
         await self._tenant.delete_all_datasets()
 
-    async def get_dataset(self, dsid:int):
-        """Get the specified dataset.
+    async def get_dataset(self, dsid, config=None):
+        """Get the specified dataset, or optionally create it if not exist.
 
         Args:
             dsid: dataset id
+            config: optional config to create dataset
 
         Returns:
             Dataset: The Dataset object
         """
-        desc = await self._tenant.get_dataset(dsid)
+        try:
+            desc = await self._tenant.get_dataset(dsid)
+        except UnexpectedStatus as e:
+            if e.status != 404 or config is None:
+                raise e
+            desc = await self._tenant.create_dataset(dsid, config)
         return Dataset(self._tenant, dsid, desc['config'])
 
-    async def set_dataset(self, dsid:int, config:dict):
-        """Update the specified dataset, or create it if not exist.
+    async def set_dataset(self, dsid, config):
+        """Update the specified dataset.
 
         Args:
             dsid: dataset id
@@ -776,21 +830,21 @@ class Repository:
         try:
             desc = await self._tenant.update_dataset(dsid, config)
         except UnexpectedStatus as e:
-            if e.status == 404:
-                desc = await self._tenant.create_dataset(dsid, config)
-            else:
+            if e.status != 404:
                 raise e
+            desc = await self._tenant.create_dataset(dsid, config)
         return Dataset(self._tenant, dsid, desc['config'])
 
-    async def del_dataset(self, dsid:int):
+    async def del_dataset(self, dsid, missing_ok=False):
         """Delete the specified dataset.
 
         Args:
             dsid: The dataset id
+            missing_ok: True to ignore dataset not found.
         """
-        await self._tenant.delete_dataset(dsid)
+        await self._tenant.delete_dataset(dsid, missing_ok)
 
-    async def set_adhoc(self, freq:int, pipeline:dict):
+    async def set_adhoc(self, freq, pipeline):
         """Create an Adhoc Object.
 
         Args:
