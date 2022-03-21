@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import os
 import time
+import datetime
 import base64
 import getpass
 import json
@@ -166,10 +167,6 @@ class Client:
                                 if 'rlt' in data:
                                     rlt = data['rlt']
                             return resp.status, rlt
-                        # resp.headers[aiohttp.hdrs.CONTENT_TYPE] == 'application/json':
-                        # We can not retry here because Poll Dataset Data will return 202 if there
-                        # are scheduled task. but we must retry here because if we release semaphone,
-                        # we don't know when we can acquire it again.
                         elif resp.status == 202: # API server asks for retry
                             continue
                         else:
@@ -351,17 +348,27 @@ class Tenant(Client):
         logging.info(f'status={status} dsid={dsid}')
         return rlt
 
-    async def get_dataset(self, dsid):
+    async def get_dataset(self, dsid, missing_ok=False):
         # 200 - ok, return read dataset descriptor
-        status, rlt = await self._request('GET', f'/cq/dataset/{dsid}', [200])
-        logging.info(f'status={status} dsid={dsid}')
-        return rlt
+        # 404 - error, dataset not found
+        code = [200, 404] if missing_ok else [200]
+        status, rlt = await self._request('GET', f'/cq/dataset/{dsid}', code)
+        if status != 404 or not missing_ok:
+            logging.info(f'status={status} dsid={dsid}')
+            return rlt
+        else:
+            return None
 
-    async def update_dataset(self, dsid, config):
+    async def update_dataset(self, dsid, config, missing_ok=False):
         # 200 - ok, return modified dataset descriptor
-        status, rlt = await self._request('PATCH', f'/cq/dataset/{dsid}', [200], config)
-        logging.info(f'status={status} dsid={dsid}')
-        return rlt
+        # 404 - error, dataset not found
+        code = [200, 404] if missing_ok else [200]
+        status, rlt = await self._request('PATCH', f'/cq/dataset/{dsid}', code, config)
+        if status != 404 or not missing_ok:
+            logging.info(f'status={status} dsid={dsid}')
+            return rlt
+        else:
+            return None
 
     async def delete_dataset(self, dsid, missing_ok=False):
         # 204 - ok, return None
@@ -390,17 +397,27 @@ class Tenant(Client):
         logging.info(f'status={status} dsid={dsid} plid={plid}')
         return rlt
 
-    async def get_pipeline(self, dsid, plid):
+    async def get_pipeline(self, dsid, plid, missing_ok=False):
         # 200 - ok, return read pipeline descriptor
-        status, rlt = await self._request('GET', f'/cq/dataset/{dsid}/pipeline/{plid}', [200])
-        logging.info(f'status={status} dsid={dsid} plid={plid}')
-        return rlt
+        # 404 - error, pipeline not found
+        code = [200, 404] if missing_ok else [200]
+        status, rlt = await self._request('GET', f'/cq/dataset/{dsid}/pipeline/{plid}', code)
+        if status != 404 or not missing_ok:
+            logging.info(f'status={status} dsid={dsid} plid={plid}')
+            return rlt
+        else:
+            return None
 
-    async def update_pipeline(self, dsid, plid, config):
+    async def update_pipeline(self, dsid, plid, config, missing_ok=False):
         # 200 - ok, return modified pipeline descriptor
-        status, rlt = await self._request('PATCH', f'/cq/dataset/{dsid}/pipeline/{plid}', [200], config)
-        logging.info(f'status={status} dsid={dsid} plid={plid}')
-        return rlt
+        # 404 - error, dataset not found
+        code = [200, 404] if missing_ok else [200]
+        status, rlt = await self._request('PATCH', f'/cq/dataset/{dsid}/pipeline/{plid}', code, config)
+        if status != 404 or not missing_ok:
+            logging.info(f'status={status} dsid={dsid} plid={plid}')
+            return rlt
+        else:
+            return None
 
     async def delete_pipeline(self, dsid, plid, missing_ok=False):
         # 204 - ok, return None
@@ -485,6 +502,12 @@ class _translate_rlts:
         for ts, rlt in zip(self.tsidx, self.rlts):
             yield _translate_table(rlt, ts)
 
+TZINFO = datetime.datetime.now().astimezone().tzinfo
+def _get_utc_timestamp(ts):
+    if ts.tz is None:
+        ts = ts.tz_localize(tz=TZINFO)
+    return ts.timestamp()
+
 class Adhoc:
     @staticmethod
     async def _create(tenant, freq, pipeline):
@@ -512,7 +535,7 @@ class Adhoc:
         delta = pd.Timedelta(freq_str)
         start = pd.Timestamp(ts).floor(freq_str)
         end = start + delta
-        table = await self._tenant.execute_adhoc(self.pid, start.timestamp(), end.timestamp(), series)
+        table = await self._tenant.execute_adhoc(self.pid, _get_utc_timestamp(start), _get_utc_timestamp(end), series)
         return pd.DataFrame(_translate_table(table, None), columns=columns)
 
     async def _read_range(self, dts, series, columns=None, refresh=True):
@@ -525,7 +548,7 @@ class Adhoc:
         for ts in dts:
             start = ts.floor(freq_str)
             end = start + delta
-            coro = self._tenant.execute_adhoc(self.pid, start.timestamp(), end.timestamp(), series)
+            coro = self._tenant.execute_adhoc(self.pid, _get_utc_timestamp(start), _get_utc_timestamp(end), series)
             tasks.append(asyncio.create_task(coro))
             tsidx.append(start)
         rlts = await asyncio.gather(*tasks, return_exceptions=True)
@@ -571,7 +594,7 @@ class Pipeline:
     async def _read_point(self, ts, columns=None):
         freq_str = f"{self._dset.conf['freq']}S"
         start = ts.floor(freq_str)
-        table = await self._tenant.query_pipeline_data(self._dset.dsid, self.plid, start.timestamp())
+        table = await self._tenant.query_pipeline_data(self._dset.dsid, self.plid, _get_utc_timestamp(start))
         return pd.DataFrame(_translate_table(table, None), columns=columns)
 
     async def _read_range(self, dts, columns=None):
@@ -580,7 +603,7 @@ class Pipeline:
         freq_str = f"{self._dset.conf['freq']}S"
         for ts in dts:
             start = ts.floor(freq_str)
-            coro = self._tenant.query_pipeline_data(self._dset.dsid, self.plid, start.timestamp())
+            coro = self._tenant.query_pipeline_data(self._dset.dsid, self.plid, _get_utc_timestamp(start))
             tasks.append(asyncio.create_task(coro))
             tsidx.append(start)
         rlts = await asyncio.gather(*tasks, return_exceptions=True)
@@ -649,11 +672,8 @@ class Dataset:
         Returns:
             The pipeline object with the specified id
         """
-        try:
-            pipe = await self._tenant.get_pipeline(self.dsid, plid)
-        except UnexpectedStatus as e:
-            if e.status != 404 or config is None:
-                raise e
+        pipe = await self._tenant.get_pipeline(self.dsid, plid, config is not None)
+        if pipe is None:
             pipe = await self._tenant.create_pipeline(self.dsid, plid, config)
         return Pipeline(self._tenant, self, plid, pipe['config'])
 
@@ -667,11 +687,8 @@ class Dataset:
         Returns:
             The pipeline object
         """
-        try:
-            pipe = await self._tenant.update_pipeline(self.dsid, plid, config)
-        except UnexpectedStatus as e:
-            if e.status != 404:
-                raise e
+        pipe = await self._tenant.update_pipeline(self.dsid, plid, config, True)
+        if pipe is None:
             pipe = await self._tenant.create_pipeline(self.dsid, plid, config)
         return Pipeline(self._tenant, self, plid, pipe['config'])
 
@@ -699,7 +716,7 @@ class Dataset:
         tsidx = []
         for ts in dts:
             start = ts.floor(freq_str)
-            coro = self._tenant.patch_dataset_data(self.dsid, start.timestamp(), overwrite)
+            coro = self._tenant.patch_dataset_data(self.dsid, _get_utc_timestamp(start), overwrite)
             tasks.append(asyncio.create_task(coro))
             tsidx.append(start)
         rlts = await asyncio.gather(*tasks, return_exceptions=True)
@@ -720,7 +737,7 @@ class Dataset:
         tsidx = []
         for ts in dts:
             start = ts.floor(freq_str)
-            coro = self._tenant.poll_dataset_data(self.dsid, start.timestamp())
+            coro = self._tenant.poll_dataset_data(self.dsid, _get_utc_timestamp(start))
             tasks.append(asyncio.create_task(coro))
             tsidx.append(start)
         rlts = await asyncio.gather(*tasks, return_exceptions=True)
@@ -744,7 +761,7 @@ class Dataset:
 
     async def _monitor_loop(self, next_ts, delta, coro):
         while True:
-            rlt = await self._tenant.poll_dataset_data(self.dsid, next_ts.timestamp())
+            rlt = await self._tenant.poll_dataset_data(self.dsid, _get_utc_timestamp(next_ts))
             if rlt is None: # 204
                 logging.debug(f'204 for {next_ts}, retried')
                 await asyncio.sleep(3)
@@ -809,11 +826,8 @@ class Repository:
         Returns:
             Dataset: The Dataset object
         """
-        try:
-            desc = await self._tenant.get_dataset(dsid)
-        except UnexpectedStatus as e:
-            if e.status != 404 or config is None:
-                raise e
+        desc = await self._tenant.get_dataset(dsid, config is not None)
+        if desc is None:
             desc = await self._tenant.create_dataset(dsid, config)
         return Dataset(self._tenant, dsid, desc['config'])
 
@@ -827,11 +841,8 @@ class Repository:
         Returns:
             The created or updated dataset object
         """
-        try:
-            desc = await self._tenant.update_dataset(dsid, config)
-        except UnexpectedStatus as e:
-            if e.status != 404:
-                raise e
+        desc = await self._tenant.update_dataset(dsid, config, True)
+        if desc is None:
             desc = await self._tenant.create_dataset(dsid, config)
         return Dataset(self._tenant, dsid, desc['config'])
 

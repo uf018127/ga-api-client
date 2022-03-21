@@ -63,7 +63,7 @@ async def main():
         pipe = await dset.set_pipeline(pipe_id, pipe_conf)
 
         # patch dataset data
-        dts = pd.date_range('2022-03-11 12:00:00+08:00', end='2022-03-11 13:00:00+08:00', freq='5T')
+        dts = pd.date_range('2022-03-11 12:00:00', end='2022-03-11 13:00:00', freq='5T')
         print(await dset.patch_data(dts))
         # poll dataset data
         print(await dset.poll_data(dts))
@@ -71,7 +71,7 @@ async def main():
         df = await pipe.read_data(dts, columns=['ts','forward','opposite'])
         print(df)
         # read pipeline data point
-        df = await pipe.read_data('2022-03-11 12:00:00+08:00', columns=['forward','opposite'])
+        df = await pipe.read_data('2022-03-11 12:00:00', columns=['forward','opposite'])
         print(df)
 
         # delete pipeline
@@ -97,11 +97,11 @@ async def main():
             ]
         })
         # read adhoc data range
-        dts = pd.date_range('2022-03-11 12:00:00+08:00', end='2022-03-11 13:00:00+08:00', freq='5T')
+        dts = pd.date_range('2022-03-11 12:00:00', end='2022-03-11 13:00:00', freq='5T')
         df = await adhoc.read_data(dts, 'hour', columns=['ts','forward','opposite'])
         print(df)
         # read adhoc data point
-        ts = pd.Timestamp('2022-03-11 12:00:00+08:00')
+        ts = pd.Timestamp('2022-03-11 12:00:00')
         df = await adhoc.read_data(ts, 'hour', columns=['forward','opposite'])
         print(df)
 
