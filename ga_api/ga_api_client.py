@@ -7,6 +7,7 @@ import base64
 import getpass
 import json
 import logging
+import math
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes # 36.0.0
 import aiohttp # 3.8.1
 import pandas as pd # 1.4.2
@@ -142,7 +143,8 @@ class Client:
             self._last_auth = time.time()
 
     async def _request(self, method, path, code, data=None):
-        if time.time() - self._last_auth >= ACCESS_TOKEN_TIMEOUT: # need to authenticate
+        # authenticate if required
+        if time.time() - self._last_auth >= ACCESS_TOKEN_TIMEOUT:
             retry_count = 0
             while True:
                 try:
@@ -154,6 +156,7 @@ class Client:
                         logging.warning(f'retry {retry_count}-th time')
                     else:
                         raise e
+        # send the request
         retry_count = 0
         async with self._sem:
             while True:
@@ -178,6 +181,7 @@ class Client:
                         retry_count += 1
                         logging.warning(f'{method} {path}, retry {retry_count}')
                     else:
+                        logging.error(f'{method} {path} fail')
                         raise e
 
 class System(Client):
@@ -461,24 +465,30 @@ class Tenant(Client):
         logging.info(f'status={status} dsid={dsid} plid={plid} ts={_logtime(ts)}')
         return rlt if isinstance(rlt, list) else []
 
-def _compute_ncol(pipeline):
-    ncol = 0
+def _compute_kcol_mcol(pipeline):
+    kcol = 0 # key columns
+    mcol = 0 # mtr columns
     if 'bucket' in pipeline:
         for bkt in pipeline['bucket']:
             if bkt[0] in ['$distinctTuple','enumTuple']:
                 # each field introduce one key column
-                ncol += len(bkt[1]['fields'])
+                kcol += len(bkt[1]['fields'])
             else:
                 # each tier introduce one key column
-                ncol += 1
+                kcol += 1
     if 'metric' in pipeline:
         # each metric introduce two columns
-        ncol += len(pipeline['metric']) * 2
-    return ncol
+        mcol += len(pipeline['metric']) * 2
+    return kcol, mcol
 
 class _translate_table:
-    def __init__(self, table, ts):
-        self.table = table if isinstance(table, list) else []
+    def __init__(self, table, ts, kcol, mcol):
+        if isinstance(table, list) and len(table) > 0:
+            self.table = table if isinstance(table, list) else []
+        else:
+            key_cols = list(itertools.repeat('!all', kcol))
+            mtr_cols = list(itertools.repeat(math.nan, mcol))
+            self.table = [key_cols+mtr_cols]
         self.ts = ts
 
     def __iter__(self):
@@ -494,13 +504,15 @@ class _translate_table:
             yield output_row
 
 class _translate_rlts:
-    def __init__(self, tsidx, rlts):
+    def __init__(self, tsidx, rlts, kcol, mcol):
         self.tsidx = tsidx
         self.rlts = rlts
+        self.kcol = kcol
+        self.mcol = mcol
 
     def __iter__(self):
         for ts, rlt in zip(self.tsidx, self.rlts):
-            yield _translate_table(rlt, ts)
+            yield _translate_table(rlt, ts, self.kcol, self.mcol)
 
 TZINFO = datetime.datetime.now().astimezone().tzinfo
 def _get_utc_timestamp(ts):
@@ -536,7 +548,8 @@ class Adhoc:
         start = pd.Timestamp(ts).floor(freq_str)
         end = start + delta
         table = await self._tenant.execute_adhoc(self.pid, _get_utc_timestamp(start), _get_utc_timestamp(end), series)
-        return pd.DataFrame(_translate_table(table, None), columns=columns)
+        kcol, mcol = _compute_kcol_mcol(self.pipeline)
+        return pd.DataFrame(_translate_table(table, None, kcol, mcol), columns=columns)
 
     async def _read_range(self, dts, series, columns=None, refresh=True):
         if refresh:
@@ -552,14 +565,15 @@ class Adhoc:
             tasks.append(asyncio.create_task(coro))
             tsidx.append(start)
         rlts = await asyncio.gather(*tasks, return_exceptions=True)
-        iter = itertools.chain.from_iterable(_translate_rlts(tsidx, rlts))
+        kcol, mcol = _compute_kcol_mcol(self.pipeline)
+        iter = itertools.chain.from_iterable(_translate_rlts(tsidx, rlts, kcol, mcol))
         return pd.DataFrame(iter, columns=columns)
 
     async def read_data(self, dts, *args, **kwargs):
         """Execute adhoc request and read its data
 
         Args:
-            dts: pandas.Timestamp, pandas.DatetimeIndex or array-like.
+            dts: str, pandas.Timestamp or array-like.
             series: 'full', 'hour' or 'day'.
             columns: column labels of frame. Defaults to None.
             refresh: refresh adhoc on API server. Defaults to True.
@@ -595,7 +609,8 @@ class Pipeline:
         freq_str = f"{self._dset.conf['freq']}S"
         start = ts.floor(freq_str)
         table = await self._tenant.query_pipeline_data(self._dset.dsid, self.plid, _get_utc_timestamp(start))
-        return pd.DataFrame(_translate_table(table, None), columns=columns)
+        kcol, mcol = _compute_kcol_mcol(self.conf['pipeline'])
+        return pd.DataFrame(_translate_table(table, None, kcol, mcol), columns=columns)
 
     async def _read_range(self, dts, columns=None):
         tasks = []
@@ -607,14 +622,15 @@ class Pipeline:
             tasks.append(asyncio.create_task(coro))
             tsidx.append(start)
         rlts = await asyncio.gather(*tasks, return_exceptions=True)
-        iter = itertools.chain.from_iterable(_translate_rlts(tsidx, rlts))
+        kcol, mcol = _compute_kcol_mcol(self.conf['pipeline'])
+        iter = itertools.chain.from_iterable(_translate_rlts(tsidx, rlts, kcol, mcol))
         return pd.DataFrame(iter, columns=columns)
 
     async def read_data(self, dts, *args, **kwargs):
         """Read pipeline data on API server.
 
         Args:
-            dts: pandas.Timestamp, pandas.DatetimeIndex or array-like.
+            dts: pandas.Timestamp or array-like.
             columns: Column labels of frame. Defaults to None.
 
         Returns:
