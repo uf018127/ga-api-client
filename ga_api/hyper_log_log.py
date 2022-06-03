@@ -1,22 +1,34 @@
+from copy import copy
 import math
 
 class HyperLogLog:
     def __init__(self, arg=None):
         if arg is None: # zero
-            self._rmem = bytes(2048)
+            self._rmem = bytearray(2048)
         elif isinstance(arg, str): # HyperLogLog Literal
-            self._rmem = bytes.fromhex(arg[2:])
-        elif type(arg) == bytes: # register mem
-            self._rmem = arg
+            self._rmem = bytearray.fromhex(arg[2:])
+        elif type(arg) == bytearray: # register mem
+            self._rmem = copy(arg)
         else:
             raise Exception('HyperLogLog construct error')
         pass
 
     def __add__(self, other):
-        return HyperLogLog(bytes(max(a,b) for a, b in zip(self._rmem, other._rmem)))
+        return HyperLogLog(bytearray(max(a,b) for a, b in zip(self._rmem, other._rmem)))
+
+    def __iadd__(self, other):
+        for i in range(len(self._rmem)):
+            self._rmem[i] = max(self._rmem[i], other._rmem[i])
+        return self
 
     def __str__(self):
         return f'h:{self.value()}'
+
+    def insert(self, hval):
+        hval &= 0x7FFFF
+        pos = hval >> 8 # 0..2047
+        val = hval & 0xFF # 0..255
+        self._rmem[pos] = max(val, self._rmem[pos])
 
     def value(self):
         N = 1 << 11

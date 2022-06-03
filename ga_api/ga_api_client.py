@@ -8,13 +8,14 @@ import getpass
 import json
 import logging
 import math
+from async_timeout import timeout
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes # 36.0.0
 import aiohttp # 3.8.1
 import pandas as pd # 1.4.2
 from .hyper_log_log import HyperLogLog
 
 def _logtime(ts):
-    return time.strftime("%H:%M:%S", time.localtime(ts))
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
 
 def pprint(value, indent=4, depth=0):
     if isinstance(value, dict):
@@ -65,6 +66,8 @@ def pprint(value, indent=4, depth=0):
                 if i < len(value)-1: # not last item
                     print(',', end='')
             print(']', end='')
+    elif isinstance(value, str): # prevent escaped unicode
+        print(f'"{value}"', end='')
     else: # simple
         print(json.dumps(value), end='')
 
@@ -90,6 +93,8 @@ class Client:
         }
         self._last_auth = 0 # timestamp of last authenticate in seconds since Eopch
         self._session = aiohttp.ClientSession()
+        # timetout
+        self.timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_connect=30, sock_read=120)
 
     async def _authenticate(self):
         authData = {
@@ -104,6 +109,7 @@ class Client:
             if resp.status != 200:
                 text = await resp.text()
                 raise UnexpectedStatus(resp.status, text)
+            # TODO: if url is wrong, the result might not be JSON
             bringup = await resp.json()
         # do captcha when enabled
         if bringup['captchaEnabled']:
@@ -129,7 +135,6 @@ class Client:
                     'answer': answer_s
                 }
         # do authenticate
-        logging.info(f'authenticate')
         url = self.url+'/authentication'
         async with self._session.post(url, json=authData, headers=self._headers, ssl=self.ssl) as resp:
             if resp.status != 201:
@@ -141,6 +146,7 @@ class Client:
                 'Authorization': body['accessToken']
             }
             self._last_auth = time.time()
+            logging.info(f'authenticate done')
 
     async def _request(self, method, path, code, data=None):
         # authenticate if required
@@ -162,7 +168,7 @@ class Client:
             while True:
                 try:
                     # logging.debug(f'{method} {path}')
-                    async with self._session.request(method, self.url+path, json=data, headers=self._headers, ssl=self.ssl) as resp:
+                    async with self._session.request(method, self.url+path, json=data, headers=self._headers, ssl=self.ssl, timeout=self.timeout) as resp:
                         if resp.status in code: # expected status code
                             rlt = None
                             if resp.content_type == 'application/json':
@@ -171,6 +177,8 @@ class Client:
                                     rlt = data['rlt']
                             return resp.status, rlt
                         elif resp.status == 202: # API server asks for retry
+                            text = await resp.text()
+                            logging.debug(f'status={resp.status} message={text}')
                             continue
                         else:
                             text = await resp.text()
@@ -229,7 +237,8 @@ class System(Client):
             }
         """
         # 200 - ok, return read system descriptor
-        _, rlt = await self._request('GET', '/cq/config', [200])
+        status, rlt = await self._request('GET', '/cq/config', [200])
+        logging.info(f'status={status}')
         return rlt
 
     async def set_system(self, config):
@@ -242,7 +251,8 @@ class System(Client):
             The modified system descriptor.
         """
         # 200 - ok, return modified system descriptor
-        _, rlt = await self._request('PATCH', '/cq/config', [200], config)
+        status, rlt = await self._request('PATCH', '/cq/config', [200], config)
+        logging.info(f'status={status}')
         return rlt
 
     async def get_all_tenants(self):
@@ -252,7 +262,8 @@ class System(Client):
             Dictionary of tenant descriptors indexed by tenant id.
         """
         # 200 - ok, return array of tenant descriptor
-        _, rlt = await self._request('GET', '/cq/config/tenant', [200])
+        status, rlt = await self._request('GET', '/cq/config/tenant', [200])
+        logging.info(f'status={status}')
         return rlt
 
     async def get_tenant(self, tid):
@@ -278,6 +289,7 @@ class System(Client):
         """
         # 200 - ok, return read tenant descriptor
         status, rlt = await self._request('GET', f'/cq/config/tenant/{tid}', [200])
+        logging.info(f'status={status}')
         return rlt if status == 200 else None
 
     async def create_tenant(self, tid, config):
@@ -288,10 +300,11 @@ class System(Client):
             config: The config part of tenant descriptor. See `System.get_tenant()`
 
         Returns:
-            Descriptor of the created tenant 
+            Descriptor of the created tenant
         """
         # 200 - ok, return created tenant descriptor
-        _, rlt = await self._request('POST', f'/cq/config/tenant/{tid}', [200], config)
+        status, rlt = await self._request('POST', f'/cq/config/tenant/{tid}', [200], config)
+        logging.info(f'status={status} tid={tid}')
         return rlt
 
     async def update_tenant(self, tid, config):
@@ -305,7 +318,8 @@ class System(Client):
             Descriptor of the target tenant
         """
         # 200 - ok, return modified tenant descriptor
-        _, rlt = await self._request('PATCH', f'/cq/config/tenant/{tid}', [200], config)
+        status, rlt = await self._request('PATCH', f'/cq/config/tenant/{tid}', [200], config)
+        logging.info(f'status={status} tid={tid}')
         return rlt
 
     async def delete_tenant(self, tid):
@@ -315,7 +329,8 @@ class System(Client):
             tid: The target tenant id
         """
         # 204 - ok, return None
-        await self._request('DELETE', f'/cq/config/tenant/{tid}', [204])
+        status, rlt = await self._request('DELETE', f'/cq/config/tenant/{tid}', [204])
+        logging.info(f'status={status} tid={tid}')
 
 class Tenant(Client):
     def __init__(self, url, user, tenant, password, ssl=True, burst=1, retry=0):
@@ -484,7 +499,7 @@ def _compute_kcol_mcol(pipeline):
 class _translate_table:
     def __init__(self, table, ts, kcol, mcol):
         if isinstance(table, list) and len(table) > 0:
-            self.table = table if isinstance(table, list) else []
+            self.table = table
         else:
             key_cols = list(itertools.repeat('!all', kcol))
             mtr_cols = list(itertools.repeat(math.nan, mcol))
@@ -605,6 +620,9 @@ class Pipeline:
         self.plid = plid
         self.conf = conf
 
+    def config(self):
+        return self.conf
+
     async def _read_point(self, ts, columns=None):
         freq_str = f"{self._dset.conf['freq']}S"
         start = ts.floor(freq_str)
@@ -657,6 +675,9 @@ class Dataset:
         self._tenant = tenant
         self.dsid = dsid
         self.conf = conf
+
+    def config(self):
+        return self.conf
 
     async def show_pipelines(self):
         """Get the config of all pipelines.
@@ -760,7 +781,7 @@ class Dataset:
         rlts = [elem if isinstance(elem, dict) else {} for elem in rlts]
         return pd.DataFrame(rlts, index=pd.Index(tsidx, name='timestamp'))
 
-    async def monitor_data(self, ts, coro):
+    async def monitor_data(self, ts, coro, *args):
         """Create a task to monitor dataset data.
 
         Args:
@@ -773,16 +794,16 @@ class Dataset:
         freq_str = f"{self.conf['freq']}S"
         next_ts = pd.Timestamp(ts).floor(freq_str)
         delta = pd.Timedelta(freq_str)
-        return asyncio.create_task(self._monitor_loop(next_ts, delta, coro))
+        return asyncio.create_task(self._monitor_loop(next_ts, delta, coro, *args))
 
-    async def _monitor_loop(self, next_ts, delta, coro):
+    async def _monitor_loop(self, next_ts, delta, coro, *args):
         while True:
             rlt = await self._tenant.poll_dataset_data(self.dsid, _get_utc_timestamp(next_ts))
             if rlt is None: # 204
                 logging.debug(f'204 for {next_ts}, retried')
                 await asyncio.sleep(3)
                 continue
-            await coro(next_ts)
+            await coro(next_ts, *args)
             next_ts += delta
 
 class Repository:
