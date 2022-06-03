@@ -1,6 +1,6 @@
 # GenieAnalytics Python Client
 
-This packet is the official Python client to access GenieAnalytics API server.
+This package is the official Python client to access GenieAnalytics API server.
 
 ## Installation
 
@@ -33,5 +33,3 @@ async def main():
 if __name__ == '__main__':
     asyncio.run(main())
 ```
-
-
