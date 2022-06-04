@@ -333,8 +333,21 @@ class System(Client):
         logging.info(f'status={status} tid={tid}')
 
 class Tenant(Client):
-    def __init__(self, url, user, tenant, password, ssl=True, burst=1, retry=0):
+    def __init__(self, url, user=None, tenant=None, password=None, ssl=True, burst=1, retry=0):
+        if user is None:
+            user = input('User:')
+        if tenant is None:
+            tenant = input('Tenant:')
+        if password is None:
+            password = getpass.getpass('Password:')
         super().__init__(url, user, tenant, password, ssl=ssl, burst=burst, retry=retry)
+
+    async def close(self):
+        """Close the underlying connections gracefully. If the event loop is stopped before
+        the system object is closed, a warning is emitted.
+        """
+        await self._session.close()
+        await asyncio.sleep(0.250)
 
     async def create_adhoc(self, pipeline):
         # 201 - ok, return adhoc id
@@ -831,8 +844,7 @@ class Repository:
         """Close the underlying connections gracefully. If the event loop is stopped before
         the repository is closed, a warning is emitted.
         """
-        await self._tenant._session.close()
-        await asyncio.sleep(0.250)
+        await self._tenant.close()
 
     async def show_datasets(self):
         """Get the configurations of all datasets.
