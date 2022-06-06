@@ -6,7 +6,10 @@ class HyperLogLog:
         if arg is None: # zero
             self._rmem = bytearray(2048)
         elif isinstance(arg, str): # HyperLogLog Literal
-            self._rmem = bytearray.fromhex(arg[2:])
+            if arg.startswith('h:'):
+                self._rmem = bytearray.fromhex(arg[2:])
+            else:
+                self._rmem = bytearray.fromhex(arg)
         elif type(arg) == bytearray: # register mem
             self._rmem = copy(arg)
         else:
@@ -22,7 +25,10 @@ class HyperLogLog:
         return self
 
     def __str__(self):
-        return f'h:{self.value()}'
+        return f'{self.value()}'
+
+    def __repr__(self):
+        return f'h:{self._rmem.hex()}'
 
     def insert(self, hval):
         hval &= 0x7FFFF

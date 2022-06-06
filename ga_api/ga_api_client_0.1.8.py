@@ -332,15 +332,6 @@ class System(Client):
         status, rlt = await self._request('DELETE', f'/cq/config/tenant/{tid}', [204])
         logging.info(f'status={status} tid={tid}')
 
-def desc_dataframe(desc_list):
-    desc_dict = {}
-    for dset in desc_list:
-        item = dset['config'].copy()
-        item.update(dset['status'])
-        item.pop('pipeline', None)
-        desc_dict[dset['_id']] = item
-    return pd.DataFrame.from_dict(desc_dict, orient='index')
-
 class Tenant(Client):
     def __init__(self, url, user=None, tenant=None, password=None, ssl=True, burst=1, retry=0):
         if user is None:
@@ -350,6 +341,13 @@ class Tenant(Client):
         if password is None:
             password = getpass.getpass('Password:')
         super().__init__(url, user, tenant, password, ssl=ssl, burst=burst, retry=retry)
+
+    async def close(self):
+        """Close the underlying connections gracefully. If the event loop is stopped before
+        the system object is closed, a warning is emitted.
+        """
+        await self._session.close()
+        await asyncio.sleep(0.250)
 
     async def create_adhoc(self, pipeline):
         # 201 - ok, return adhoc id
@@ -369,10 +367,6 @@ class Tenant(Client):
         status, rlt = await self._request('GET', '/cq/dataset', [200])
         logging.info(f'status={status} rlt={rlt}')
         return rlt
-
-    async def list_all_datasets(self):
-        dset_list = await self.get_all_datasets()
-        return desc_dataframe(dset_list)
 
     async def delete_all_datasets(self):
         # 204 - ok, return None
@@ -422,10 +416,6 @@ class Tenant(Client):
         status, rlt = await self._request('GET', f'/cq/dataset/{dsid}/pipeline', [200])
         logging.info(f'status={status} dsid={dsid}')
         return rlt
-
-    async def list_all_pipelines(self, dsid):
-        pipe_list = await self.get_all_pipelines(dsid)
-        return desc_dataframe(pipe_list)
 
     async def delete_all_pipelines(self, dsid):
         # 204 - ok, return None
@@ -643,6 +633,9 @@ class Pipeline:
         self.plid = plid
         self.conf = conf
 
+    def config(self):
+        return self.conf
+
     async def _read_point(self, ts, columns=None):
         freq_str = f"{self._dset.conf['freq']}S"
         start = ts.floor(freq_str)
@@ -696,25 +689,69 @@ class Dataset:
         self.dsid = dsid
         self.conf = conf
 
-    async def list(self):
-        """List all pipelines
+    def config(self):
+        return self.conf
+
+    async def show_pipelines(self):
+        """Get the config of all pipelines.
 
         Returns:
-            pandas.DataFrame: Pipeline configurations indexed by id.
+            dict of pipeline config indexed by pipeline id.
         """
         pipe_list = await self._tenant.get_all_pipelines(self.dsid)
-        return desc_dataframe(pipe_list)
+        pipe_dict = {}
+        for pipe in pipe_list:
+            item = pipe['config'].copy()
+            item.update(pipe['status'])
+            del item['pipeline']
+            pipe_dict[pipe['_id']] = item
+        return pd.DataFrame.from_dict(pipe_dict, orient='index')
 
-    async def pipeline(self, plid):
-        """Get pipeline
+    async def del_all_pipelines(self):
+        """Delete all pipelines of this dataset.
+        """
+        await self._tenant.delete_all_pipelines(self.dsid)
+
+    async def get_pipeline(self, plid, config=None):
+        """Get the specified pipeline, or optionally create it if not exist.
+
+        Args:
+            plid (int): pipeline id
+            config: optional config to create pipeline
 
         Returns:
-            dset: Pipeline object with the specified id.
+            The pipeline object with the specified id
         """
-        desc = await self._tenant.get_pipeline(self.dsid, plid)
-        return Pipeline(self._tenant, self, plid, desc['config'])
+        pipe = await self._tenant.get_pipeline(self.dsid, plid, config is not None)
+        if pipe is None:
+            pipe = await self._tenant.create_pipeline(self.dsid, plid, config)
+        return Pipeline(self._tenant, self, plid, pipe['config'])
 
-    async def patch(self, dts, overwrite=False):
+    async def set_pipeline(self, plid, config):
+        """Update the specified pipeline.
+
+        Args:
+            plid: pipeline id
+            config: pipeline config.
+
+        Returns:
+            The pipeline object
+        """
+        pipe = await self._tenant.update_pipeline(self.dsid, plid, config, True)
+        if pipe is None:
+            pipe = await self._tenant.create_pipeline(self.dsid, plid, config)
+        return Pipeline(self._tenant, self, plid, pipe['config'])
+
+    async def del_pipeline(self, plid, missing_ok=False):
+        """Delete the specified pipeline.
+
+        Args:
+            plid: pipeline id
+            missing_ok: True to ignore pipeline not found.
+        """
+        await self._tenant.delete_pipeline(self.dsid, plid, missing_ok)
+
+    async def patch_data(self, dts, overwrite=False):
         """Patch dataset data
 
         Args:
@@ -736,7 +773,7 @@ class Dataset:
         rlts = [elem if isinstance(elem, dict) else {} for elem in rlts]
         return pd.DataFrame(rlts, index=pd.Index(dts, name='timestamp'))
 
-    async def poll(self, dts):
+    async def poll_data(self, dts):
         """Check dataset data availability.
 
         Args:
@@ -757,7 +794,7 @@ class Dataset:
         rlts = [elem if isinstance(elem, dict) else {} for elem in rlts]
         return pd.DataFrame(rlts, index=pd.Index(tsidx, name='timestamp'))
 
-    async def monitor(self, ts, coro, *args):
+    async def monitor_data(self, ts, coro, *args):
         """Create a task to monitor dataset data.
 
         Args:
@@ -795,34 +832,79 @@ class Repository:
             burst: Maximum concurrent requests to the API server.
             retry: Number of retry at fail of sending request.
         """
+        if user is None:
+            user = input('User:')
+        if tenant is None:
+            tenant = input('Tenant:')
+        if password is None:
+            password = getpass.getpass('User Password:')
         self._tenant = Tenant(url, user, tenant, password, ssl=ssl, burst=burst, retry=retry)
 
     async def close(self):
         """Close the underlying connections gracefully. If the event loop is stopped before
         the repository is closed, a warning is emitted.
         """
-        await self._tenant._session.close()
-        await asyncio.sleep(0.250)
+        await self._tenant.close()
 
-    async def list(self):
-        """List all datasets
+    async def show_datasets(self):
+        """Get the configurations of all datasets.
 
         Returns:
-            pandas.DataFrame: Dataset configurations indexed by id.
+            pandas.DataFrame: Dataset configurations indexed by dataset id.
         """
         dset_list = await self._tenant.get_all_datasets()
-        return desc_dataframe(dset_list)
+        dset_dict = {}
+        for dset in dset_list:
+            item = dset['config'].copy()
+            item.update(dset['status'])
+            dset_dict[dset['_id']] = item
+        return pd.DataFrame.from_dict(dset_dict, orient='index')
 
-    async def dataset(self, dsid):
-        """Get dataset
+    async def del_all_datasets(self):
+        """Delete all datasets of this tenant.
+        """
+        await self._tenant.delete_all_datasets()
+
+    async def get_dataset(self, dsid, config=None):
+        """Get the specified dataset, or optionally create it if not exist.
+
+        Args:
+            dsid: dataset id
+            config: optional config to create dataset
 
         Returns:
-            dset: Dataset object with the specified id.
+            Dataset: The Dataset object
         """
-        desc = await self._tenant.get_dataset(dsid)
+        desc = await self._tenant.get_dataset(dsid, config is not None)
+        if desc is None:
+            desc = await self._tenant.create_dataset(dsid, config)
         return Dataset(self._tenant, dsid, desc['config'])
 
-    async def adhoc(self, freq, pipeline):
+    async def set_dataset(self, dsid, config):
+        """Update the specified dataset.
+
+        Args:
+            dsid: dataset id
+            config: dataset config
+
+        Returns:
+            The created or updated dataset object
+        """
+        desc = await self._tenant.update_dataset(dsid, config, True)
+        if desc is None:
+            desc = await self._tenant.create_dataset(dsid, config)
+        return Dataset(self._tenant, dsid, desc['config'])
+
+    async def del_dataset(self, dsid, missing_ok=False):
+        """Delete the specified dataset.
+
+        Args:
+            dsid: The dataset id
+            missing_ok: True to ignore dataset not found.
+        """
+        await self._tenant.delete_dataset(dsid, missing_ok)
+
+    async def set_adhoc(self, freq, pipeline):
         """Create an Adhoc Object.
 
         Args:
