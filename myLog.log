@@ -1,0 +1,6 @@
+▸ 2022-06-10 17:53:05 INFO ga_api_client.py:_authenticate(106) - bringup
+▸ 2022-06-10 17:53:06 INFO ga_api_client.py:_authenticate(149) - authenticate done
+▸ 2022-06-10 17:53:06 INFO ga_api_client.py:get_all_datasets(377) - status=200 rlt=[{'_id': 1, 'tenant': 0, 'config': {'name': 'performance', 'series': 'full', 'freq': 300, 'retainDepth': 2592000, 'retainSize': 10000000000, 'run': True}, 'status': {'created': '2022-06-09T05:35:02.655Z', 'modified': '2022-06-09T05:37:47.531Z', 'nextTick': '2022-06-10T09:50:00.000Z', 'oldest': '2022-06-02T05:40:00.000Z', 'size': 1992503138}}]
+▸ 2022-06-10 17:53:35 INFO ga_api_client.py:get_dataset(402) - status=200 dsid=1
+▸ 2022-06-10 17:53:55 INFO ga_api_client.py:get_dataset(402) - status=200 dsid=1
+▸ 2022-06-10 17:54:23 INFO ga_api_client.py:get_all_pipelines(430) - status=200 dsid=1
