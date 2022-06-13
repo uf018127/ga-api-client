@@ -351,6 +351,13 @@ class Tenant(Client):
             password = getpass.getpass('Password:')
         super().__init__(url, user, tenant, password, ssl=ssl, burst=burst, retry=retry)
 
+    async def close(self):
+        """Close the underlying connections gracefully. If the event loop is stopped before
+        the tenant object is closed, a warning is emitted.
+        """
+        await self._session.close()
+        await asyncio.sleep(0.250)
+
     async def create_adhoc(self, pipeline):
         # 201 - ok, return adhoc id
         status, rlt = await self._request('POST', '/pipeline', [201], pipeline)
@@ -801,7 +808,7 @@ class Repository:
         """Close the underlying connections gracefully. If the event loop is stopped before
         the repository is closed, a warning is emitted.
         """
-        await self._tenant._session.close()
+        await self._tenant.close()
         await asyncio.sleep(0.250)
 
     async def list(self):
