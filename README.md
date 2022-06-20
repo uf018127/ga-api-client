@@ -5,7 +5,7 @@ This package is the official Python client to access GenieAnalytics API server.
 ## Installation
 
 ```
-pip install -i https://test.pypi.org/simple/ ga-api-client-uf018127
+pip install ga-api-client-uf018127
 ```
 
 ## Import Modules

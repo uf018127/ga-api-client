@@ -182,7 +182,7 @@ class Client:
                             continue
                         else:
                             text = await resp.text()
-                            logging.error(f'status={resp.status} message={text}')
+                            logging.error(f'unexpected status={resp.status} message={text}')
                             raise UnexpectedStatus(resp.status, text)
                 except aiohttp.ClientError as e:
                     if retry_count < self.retry: # user asks for retry
