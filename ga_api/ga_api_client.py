@@ -781,13 +781,17 @@ class Dataset:
 
     async def _monitor_loop(self, next_ts, delta, coro, *args):
         while True:
-            rlt = await self._tenant.poll_dataset_data(self.dsid, _get_utc_timestamp(next_ts))
-            if rlt is None: # 204
-                logging.debug(f'204 for {next_ts}, retried')
-                await asyncio.sleep(3)
-                continue
-            await coro(next_ts, *args)
-            next_ts += delta
+            try:
+                rlt = await self._tenant.poll_dataset_data(self.dsid, _get_utc_timestamp(next_ts))
+                if rlt is None: # 204
+                    logging.debug(f'204 for {next_ts}, retried')
+                    await asyncio.sleep(3)
+                    continue
+                await coro(next_ts, *args)
+            except Exception as e:
+                logging.exception(e)
+            finally:
+                next_ts += delta
 
 class Repository:
     def __init__(self, url, user=None, tenant=None, password=None, ssl=True, burst=1, retry=0):

@@ -5,3 +5,4 @@ __pycache__
 fet*
 *.csv
 *.ipynb
+*.log

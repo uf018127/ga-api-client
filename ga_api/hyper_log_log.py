@@ -19,6 +19,9 @@ class HyperLogLog:
     def __add__(self, other):
         return HyperLogLog(bytearray(max(a,b) for a, b in zip(self._rmem, other._rmem)))
 
+    def __radd__(self, other):
+        return HyperLogLog(bytearray(max(a,b) for a, b in zip(self._rmem, other._rmem)))
+
     def __iadd__(self, other):
         for i in range(len(self._rmem)):
             self._rmem[i] = max(self._rmem[i], other._rmem[i])
